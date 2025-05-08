@@ -98,11 +98,7 @@ The frontend is built with HTML, CSS, and JavaScript, using:
 2. Open the `public/index.html` file in your web browser, or serve it using a local web server:
    - Using Python:
      ```bash
-     python -m http.server 8000
-     ```
-   - Using Node.js (if installed):
-     ```bash
-     npx serve public
+     python -m http.server 8000 --directory public
      ```
 
 3. Access the application at http://localhost:8000 (or the port specified by your web server)
