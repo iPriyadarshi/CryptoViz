@@ -9,6 +9,7 @@
 
 CryptoViz is a comprehensive cryptocurrency visualization platform designed to simplify cryptocurrency analysis by providing real-time visual insights. Whether you're an investor, trader, or just a curious enthusiast, our platform helps you make informed decisions with intuitive data representation.
 
+![Top Gainers](https://github.com/iPriyadarshi/CryptoViz/blob/main/top-gainers-cryptoviz.png)
 ## 🚀 Key Features
 
 - **Live Cryptocurrency Price Tracking** - Stay updated with real-time market movements
