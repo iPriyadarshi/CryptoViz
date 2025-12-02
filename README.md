@@ -169,6 +169,7 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 For questions or feedback, please open an issue on GitHub.
 
+## Note: The live link given may not show correct data as live scraping is not functional on the deployed server
 ---
 
 Built with ❤️ for cryptocurrency enthusiasts and data visualization lovers.
