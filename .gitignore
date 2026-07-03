@@ -1,0 +1,20 @@
+# Environment / secrets
+.env
+
+# Local SQLite database (used when Turso is not configured)
+crypto.db
+*.db
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
