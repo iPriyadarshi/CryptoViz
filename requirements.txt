@@ -4,7 +4,8 @@ flask_cors
 nltk
 numpy
 pandas
-dotenv
+python-dotenv
 requests
 sqlalchemy
 sqlalchemy-libsql
+gunicorn
