@@ -21,14 +21,19 @@
 .social-link {
     color: var(--text-secondary);
     font-size: 1.25rem;
-    transition: color 0.2s ease;
+    transition: color 0.2s ease, background-color 0.2s ease, transform 0.2s ease;
     display: flex;
     align-items: center;
     justify-content: center;
+    width: 44px;
+    height: 44px;
+    border-radius: 50%;
 }
 
 .social-link:hover {
     color: var(--primary-color);
+    background-color: rgba(var(--primary-color-rgb), 0.1);
+    transform: translateY(-2px);
 }
 
 .social-icon {

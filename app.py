@@ -7,7 +7,7 @@ same-origin server.
 
 API endpoints provide cryptocurrency data, historical prices, volatility metrics,
 correlation analysis, sentiment data, and top gainers. All data is persisted in a
-database (see database.py) — by default a Turso (libSQL / cloud SQLite) database,
+database (see database.py) - by default a Turso (libSQL / cloud SQLite) database,
 falling back to a local SQLite file when Turso is not configured.
 
 The application also manages background threads for periodically updating

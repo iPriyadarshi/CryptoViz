@@ -1,38 +1,183 @@
 /* About Page Specific Styles */
-p {
-    font-size: 1.2rem;
+
+.team-page {
+    max-width: 980px;
+    margin: 0 auto;
+    padding: 2.5rem 0 4rem;
 }
 
-/* Team member cards */
-.col-md-4 {
-    margin-bottom: 30px;
+/* --- Hero --- */
+.team-hero {
+    text-align: center;
+    padding: 0.5rem 0 1rem;
 }
 
-.col-md-4 img {
-    border: 3px solid var(--border-color);
-    transition: transform 0.3s ease;
-}
-
-.col-md-4 img:hover {
-    transform: scale(1.05);
-}
-
-.col-md-4 h4 {
-    margin-top: 15px;
-    color: var(--text-color);
-}
-
-.col-md-4 p {
-    color: var(--text-secondary);
-}
-
-.col-md-4 a {
+.team-eyebrow {
+    display: inline-block;
+    margin-bottom: 1rem;
+    padding: 0.35rem 0.9rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
     color: var(--primary-color);
-    text-decoration: none;
-    transition: color 0.3s ease;
+    background: var(--gradient-soft);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-pill);
 }
 
-.col-md-4 a:hover {
-    color: var(--secondary-color);
-    text-decoration: underline;
+.team-hero h1 {
+    font-size: clamp(1.9rem, 4vw, 2.6rem);
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    margin-bottom: 1rem;
+}
+
+.team-hero .lead {
+    max-width: 660px;
+    margin: 0 auto;
+    color: var(--text-secondary);
+    font-size: 1.1rem;
+    line-height: 1.7;
+}
+
+/* --- Sections --- */
+.team-section {
+    margin-top: 3.5rem;
+}
+
+.team-page .section-title {
+    font-size: 1.45rem;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    margin-bottom: 1rem;
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+}
+
+.team-page .section-title::before {
+    content: "";
+    width: 4px;
+    height: 1.15em;
+    border-radius: 4px;
+    background: var(--gradient);
+}
+
+/* --- Team member cards --- */
+.team-card {
+    height: 100%;
+    text-align: center;
+    background-color: var(--card-bg);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-lg);
+    padding: 2rem 1.5rem;
+    transition: transform 0.25s ease, box-shadow 0.25s ease, border-color 0.25s ease;
+}
+
+.team-card:hover {
+    transform: translateY(-4px);
+    border-color: rgba(var(--primary-color-rgb), 0.4);
+    box-shadow: var(--shadow-hover);
+}
+
+.team-avatar {
+    width: 140px;
+    height: 140px;
+    border-radius: 50%;
+    object-fit: cover;
+    display: block;
+    margin: 0 auto 1.35rem;
+    border: 3px solid var(--card-bg);
+    box-shadow: 0 0 0 3px rgba(var(--primary-color-rgb), 0.55), var(--shadow-md);
+}
+
+.team-name {
+    font-size: 1.2rem;
+    font-weight: 600;
+    margin-bottom: 0.4rem;
+}
+
+.team-role {
+    display: inline-block;
+    padding: 0.25rem 0.75rem;
+    font-size: 0.78rem;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    color: var(--primary-color);
+    background: rgba(var(--primary-color-rgb), 0.1);
+    border-radius: var(--radius-pill);
+    margin-bottom: 1rem;
+}
+
+.team-bio {
+    color: var(--text-secondary);
+    font-size: 0.95rem;
+    line-height: 1.6;
+    margin-bottom: 1.25rem;
+}
+
+.team-links {
+    display: flex;
+    justify-content: center;
+    gap: 0.6rem;
+}
+
+.team-links a {
+    padding: 0.4rem 0.9rem;
+    font-size: 0.85rem;
+    font-weight: 500;
+    color: var(--text-color);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-pill);
+    transition: color 0.2s ease, border-color 0.2s ease, background-color 0.2s ease;
+}
+
+.team-links a:hover {
+    color: var(--primary-color);
+    border-color: var(--primary-color);
+    background-color: rgba(var(--primary-color-rgb), 0.08);
+    text-decoration: none;
+}
+
+/* --- Connect --- */
+.connect-lead {
+    color: var(--text-secondary);
+    font-size: 1.05rem;
+    margin-bottom: 1.25rem;
+}
+
+.connect-links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+}
+
+.connect-link {
+    padding: 0.6rem 1.25rem;
+    font-weight: 600;
+    color: var(--text-color);
+    background-color: var(--card-bg);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-pill);
+    transition: color 0.2s ease, border-color 0.2s ease, transform 0.2s ease;
+}
+
+.connect-link:hover {
+    color: var(--primary-color);
+    border-color: var(--primary-color);
+    transform: translateY(-2px);
+    text-decoration: none;
+}
+
+/* --- Responsive --- */
+@media (max-width: 576px) {
+    .team-page {
+        padding: 1.5rem 0 3rem;
+    }
+
+    .team-section {
+        margin-top: 2.5rem;
+    }
 }

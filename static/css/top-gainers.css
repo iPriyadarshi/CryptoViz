@@ -54,22 +54,11 @@
 }
 
 .stat-item {
-    background-color: var(--card-bg);
+    background-color: rgba(var(--primary-color-rgb), 0.04);
     border: 1px solid var(--border-color);
-    border-radius: 8px;
-    padding: 0.75rem;
+    border-radius: var(--radius);
+    padding: 1rem;
     text-align: center;
-}
-
-.stat-label {
-    font-size: 0.9rem;
-    color: var(--text-secondary);
-    margin-bottom: 0.5rem;
-}
-
-.stat-value {
-    font-size: 1.2rem;
-    font-weight: 600;
 }
 
 /* Last Updated Styling */
@@ -136,36 +125,12 @@
     width: 100%;
     border-collapse: collapse;
     color: var(--text-color);
-    background-color: var(--card-bg);
-    border-radius: 8px;
+    border-radius: var(--radius);
     overflow: hidden;
-    box-shadow: var(--card-shadow);
     margin-bottom: 0;
 }
 
-.gainers-table th,
-.gainers-table td {
-    padding: 12px 15px;
-    text-align: left;
-    border-bottom: 1px solid var(--border-color);
-    color: var(--text-color);
-    transition: background-color 0.3s ease, color 0.3s ease;
-}
-
-.gainers-table th {
-    background-color: var(--table-header-bg);
-    color: var(--text-color);
-    font-weight: 600;
-    border-bottom: 2px solid var(--border-color);
-}
-
-.gainers-table tbody tr {
-    transition: background-color 0.2s ease;
-}
-
-.gainers-table tbody tr:hover {
-    background-color: var(--hover-bg);
-}
+/* Table cell/header styling is provided by common.css */
 
 .gainers-table .crypto-name {
     display: flex;
@@ -196,26 +161,7 @@
     border-radius: 50%;
 }
 
-/* Price Change Styling */
-.price-change {
-    display: flex;
-    align-items: center;
-    gap: 5px;
-    font-weight: 600;
-    padding: 4px 8px;
-    border-radius: 4px;
-    width: fit-content;
-}
-
-.price-change.positive {
-    color: var(--positive-color);
-    background-color: rgba(var(--positive-color-rgb), 0.1);
-}
-
-.price-change.negative {
-    color: var(--negative-color);
-    background-color: rgba(var(--negative-color-rgb), 0.1);
-}
+/* Price-change pill styling is provided by common.css */
 
 /* Loading and Error Overlays */
 .loading-spinner {

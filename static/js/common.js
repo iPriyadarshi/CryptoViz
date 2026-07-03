@@ -6,7 +6,29 @@ document.addEventListener('DOMContentLoaded', function() {
     initSvgIcons();
     initThemeSwitcher();
     initNavigation();
+    initNavbarScroll();
 });
+
+/**
+ * Add a subtle shadow to the sticky navbar once the page is scrolled.
+ */
+function initNavbarScroll() {
+    const navbar = document.querySelector('.navbar');
+    if (!navbar) {
+        return;
+    }
+
+    const onScroll = function() {
+        if (window.scrollY > 8) {
+            navbar.classList.add('scrolled');
+        } else {
+            navbar.classList.remove('scrolled');
+        }
+    };
+
+    window.addEventListener('scroll', onScroll, { passive: true });
+    onScroll();
+}
 
 /**
  * Initialize SVG icons throughout the page
@@ -556,9 +578,13 @@ function initNavigation() {
     // Get the current page URL
     const currentPage = window.location.pathname;
 
-    // Loop through each link and set the active class if it matches the current page
+    // Loop through each link and set the active class if it matches the current page.
+    // Treat the site root ("/") as the home page (index.html).
     navLinks.forEach(link => {
-        if (link.getAttribute('href') === currentPage) {
+        const href = link.getAttribute('href');
+        const isHome = (currentPage === '/' || currentPage === '/index.html') &&
+            (href === '/index.html' || href === '/');
+        if (href === currentPage || isHome) {
             link.classList.add('active');
         } else {
             link.classList.remove('active');

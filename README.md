@@ -7,7 +7,7 @@
 ![Bootstrap](https://img.shields.io/badge/Bootstrap-5.1.3-purple)
 ![Chart.js](https://img.shields.io/badge/Chart.js-Latest-orange)
 
-CryptoViz is a comprehensive cryptocurrency visualization platform designed to simplify cryptocurrency analysis by providing real-time visual insights. Whether you're an investor, trader, or just a curious enthusiast, our platform helps you make informed decisions with intuitive data representation.
+CryptoViz is a cryptocurrency analytics dashboard that brings live prices, historical trends, volatility, correlation and market sentiment for the top cryptocurrencies into a single, interactive interface. It runs as one Flask application that scrapes market data, stores it in a database, and serves both the REST API and the frontend.
 
 ![Top Gainers](https://github.com/iPriyadarshi/CryptoViz/blob/main/top-gainers-cryptoviz.png)
 ## 🚀 Key Features
@@ -36,7 +36,7 @@ CryptoViz/
 ├── data_utils.py           # Analytics + background update threads
 ├── historical_scraper.py   # One-off historical price backfill
 ├── requirements.txt
-├── .env                    # Flask + Turso configuration (not committed)
+├── .env.example            # Sample config; copy to .env and fill in (.env is gitignored)
 ├── static/                 # Frontend assets (css, js, images)
 │   ├── css/
 │   ├── js/
@@ -67,9 +67,9 @@ frontend server to run.
 ### Database
 
 All data is stored in a database via `database.py`:
-- `crypto_prices` — time-series price rows (history, volatility, correlation)
-- `sentiment_snapshots` — one JSON snapshot per sentiment scrape
-- `top_gainers_snapshots` — one JSON snapshot per top-gainers scrape
+- `crypto_prices` - time-series price rows (history, volatility, correlation)
+- `sentiment_snapshots` - one JSON snapshot per sentiment scrape
+- `top_gainers_snapshots` - one JSON snapshot per top-gainers scrape
 
 By default it connects to a [Turso](https://turso.tech/) (libSQL / cloud SQLite)
 database. If no Turso credentials are configured, it automatically falls back to a
@@ -105,11 +105,8 @@ local `crypto.db` SQLite file so the app runs without any cloud setup.
    ```bash
    cp .env.example .env
    ```
-   To use Turso, set `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN`:
-   ```bash
-   turso db show <db-name> --url         # -> TURSO_DATABASE_URL
-   turso db tokens create <db-name>      # -> TURSO_AUTH_TOKEN
-   ```
+   To use Turso, set `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN`.
+   
    Leave them blank to use the local SQLite fallback.
 
 4. (Optional) Backfill 31 days of historical price data:
@@ -121,8 +118,8 @@ local `crypto.db` SQLite file so the app runs without any cloud setup.
    ```bash
    python app.py
    ```
-   The tables are created automatically on startup. The full application — both
-   the website and the API — is available at http://127.0.0.1:5000
+   The tables are created automatically on startup. The full application - both
+   the website and the API - is available at http://127.0.0.1:5000
 
 ## 📊 Available Pages
 
@@ -130,49 +127,44 @@ local `crypto.db` SQLite file so the app runs without any cloud setup.
 - **Normalized Trend** - Compare price trends of different cryptocurrencies
 - **Volatility** - Analyze price volatility metrics
 - **Correlation** - View correlation between different cryptocurrencies
-- **Sentiment** - Track market sentiment from various sources
+- **Sentiment** - Track market sentiment from news and social sources
 - **Top Gainers** - Monitor the best performing cryptocurrencies
+- **Website Info** - How the platform works and where the data comes from
+- **About** - The team behind CryptoViz
 
 ## 🔌 API Endpoints
 
 The backend provides the following API endpoints:
 
-- `GET /api/crypto` - Get the latest cryptocurrency data
-- `GET /api/crypto/{symbol}/history` - Get historical price data for a specific cryptocurrency
-- `GET /api/crypto/{symbol}/volatility` - Get volatility metrics for a specific cryptocurrency
-- `GET /api/volatility` - Get volatility metrics for all cryptocurrencies
-- `GET /api/correlation` - Get correlation matrix for all cryptocurrencies
-- `GET /api/sentiment` - Get the latest sentiment data
-- `GET /api/sentiment/history` - Get historical sentiment data
-- `GET /api/top-gainers` - Get the latest top gaining cryptocurrencies
+- `GET /api/crypto` - Latest data for all tracked cryptocurrencies
+- `GET /api/crypto/{symbol}/history` - Historical price data for a specific cryptocurrency
+- `GET /api/crypto/{symbol}/volatility` - Volatility metrics for a specific cryptocurrency
+- `GET /api/crypto/volatility` - Volatility metrics for all cryptocurrencies
+- `GET /api/crypto/correlation` - Correlation matrix for all cryptocurrencies
+- `GET /api/sentiment` - Latest complete sentiment data
+- `GET /api/sentiment/overall` - Overall market sentiment (supports `?days=1|7|30`)
+- `GET /api/sentiment/rankings` - Most positive / negative cryptocurrencies by sentiment
+- `GET /api/sentiment/sources` - Raw sentiment sources (filter by `type`, `crypto`, `limit`, `days`)
+- `GET /api/sentiment/trends` - Sentiment and price trend over time
+- `GET /api/top-gainers` - Latest top gaining cryptocurrencies
 - `GET /api/top-gainers/update` - Trigger a top gainers data update
 - `GET /api/sentiment/update` - Trigger a sentiment data update
+
+An HTML summary of these endpoints is also available at `/api-docs`.
 
 ## 🔄 Data Sources
 
 CryptoViz collects data from multiple sources:
 
-- **Price Data**: CoinMarketCap (primary), CoinGecko (fallback)
-- **Sentiment Data**: News articles, social media, and specialized crypto sentiment sources
-- **Top Gainers**: CoinGecko API
+- **Price data**: CoinMarketCap (primary), CoinGecko API (fallback)
+- **Top gainers**: CoinMarketCap (primary), CoinGecko API (fallback)
+- **Sentiment**: crypto news sites and Reddit (r/CryptoCurrency) scored with NLTK's VADER model, combined with the Crypto Fear &amp; Greed Index (weighted 50% news, 30% social, 20% index)
 
 ## 🎨 Customization
 
 ### Themes
 
 CryptoViz supports both light and dark themes. You can toggle between themes using the theme switcher in the application header.
-
-### Configuration
-
-Configuration is handled through environment variables (see `.env`):
-- `FLASK_DEBUG`: Enable/disable debug mode (default: false)
-- `FLASK_HOST`: Host to bind the server to (default: 0.0.0.0)
-- `FLASK_PORT`: Port to run the server on (default: 5000)
-- `TURSO_DATABASE_URL`: Turso database URL (blank = local SQLite fallback)
-- `TURSO_AUTH_TOKEN`: Turso auth token
-
-The frontend calls the API same-origin, so no API URL configuration is normally
-needed. If required, the base URL can be adjusted in `static/js/config.js`.
 
 ## 🤝 Contributing
 
@@ -192,7 +184,6 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 For questions or feedback, please open an issue on GitHub.
 
-## Note: The live link given may not show correct data as live scraping is not functional on the deployed server
 ---
 
 Built with ❤️ for cryptocurrency enthusiasts and data visualization lovers.

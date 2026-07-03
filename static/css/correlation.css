@@ -74,7 +74,7 @@
     border-collapse: collapse;
     margin-top: 20px;
     box-shadow: var(--shadow);
-    border-radius: 4px;
+    border-radius: var(--radius);
     overflow: hidden;
 }
 
@@ -82,15 +82,16 @@
 .correlation-table td {
     padding: 12px;
     text-align: center;
-    border: 1px solid var(--border-color);
+    border: 1px solid var(--table-border);
 }
 
 .correlation-table th {
     background-color: var(--table-header-bg);
-    color: var(--text-color);
+    color: var(--text-secondary);
     font-weight: 600;
     text-transform: uppercase;
-    font-size: 0.9rem;
+    letter-spacing: 0.04em;
+    font-size: 0.75rem;
 }
 
 .correlation-table td {
@@ -158,33 +159,7 @@
     font-weight: bold;
 }
 
-/* Time Range Buttons */
-.time-range-buttons {
-    display: flex;
-    justify-content: center;
-    gap: 10px;
-    margin: 20px 0;
-}
-
-.time-range-button {
-    padding: 8px 16px;
-    background-color: var(--card-bg);
-    color: var(--text-color);
-    border: 1px solid var(--border-color);
-    border-radius: 4px;
-    cursor: pointer;
-    transition: all 0.3s ease;
-}
-
-.time-range-button:hover {
-    background-color: var(--primary-color);
-    color: white;
-}
-
-.time-range-button.active {
-    background-color: var(--primary-color);
-    color: white;
-}
+/* Time range buttons are provided by common.css */
 
 /* Correlation Legend */
 .correlation-legend {

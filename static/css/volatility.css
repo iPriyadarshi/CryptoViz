@@ -38,28 +38,20 @@
 }
 
 /* Volatility Table */
+/* Allow the table to scroll horizontally on narrow screens */
+#volatilityTable {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+}
+
 .volatility-table {
     width: 100%;
+    min-width: 600px;
     border-collapse: collapse;
     margin-top: 20px;
 }
 
-.volatility-table th,
-.volatility-table td {
-    padding: 12px 15px;
-    text-align: left;
-    border-bottom: 1px solid var(--border-color);
-}
-
-.volatility-table th {
-    background-color: var(--card-bg);
-    color: var(--text-color);
-    font-weight: 600;
-}
-
-.volatility-table tbody tr:hover {
-    background-color: rgba(67, 97, 238, 0.05);
-}
+/* Table cell/header styling is provided by common.css */
 
 .volatility-table .crypto-name {
     display: flex;
@@ -76,8 +68,9 @@
 /* Volatility Indicator */
 .volatility-indicator {
     width: 100%;
+    min-width: 80px;
     height: 8px;
-    background-color: #e9ecef;
+    background-color: var(--border-color);
     border-radius: 4px;
     overflow: hidden;
 }
@@ -99,33 +92,7 @@
     background-color: #f94144;
 }
 
-/* Time Range Buttons */
-.time-range-buttons {
-    display: flex;
-    justify-content: center;
-    gap: 10px;
-    margin: 20px 0;
-}
-
-.time-range-button {
-    padding: 8px 16px;
-    background-color: var(--card-bg);
-    color: var(--text-color);
-    border: 1px solid var(--border-color);
-    border-radius: 4px;
-    cursor: pointer;
-    transition: all 0.3s ease;
-}
-
-.time-range-button:hover {
-    background-color: var(--primary-color);
-    color: white;
-}
-
-.time-range-button.active {
-    background-color: var(--primary-color);
-    color: white;
-}
+/* Time range buttons are provided by common.css */
 
 /* Responsive Styles */
 @media (max-width: 768px) {

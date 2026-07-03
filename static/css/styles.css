@@ -10,7 +10,7 @@
 
 .card:hover {
     transform: translateY(-5px);
-    box-shadow: 0 10px 20px rgba(0, 0, 0, 0.1);
+    box-shadow: var(--shadow-hover);
 }
 
 .card-header {
@@ -105,14 +105,14 @@
 }
 
 .crypto-item:hover {
-    background-color: rgba(var(--primary-color), 0.1);
-    border-color: rgba(var(--primary-color), 0.2);
+    background-color: rgba(var(--primary-color-rgb), 0.1);
+    border-color: rgba(var(--primary-color-rgb), 0.2);
     transform: translateX(5px);
 }
 
 .crypto-item.active {
-    background-color: rgba(var(--primary-color), 0.15);
-    border-color: rgba(var(--primary-color), 0.3);
+    background-color: rgba(var(--primary-color-rgb), 0.15);
+    border-color: rgba(var(--primary-color-rgb), 0.3);
 }
 
 .crypto-info {
@@ -125,7 +125,7 @@
     width: 36px;
     height: 36px;
     border-radius: 50%;
-    background-color: rgba(var(--primary-color), 0.1);
+    background-color: rgba(var(--primary-color-rgb), 0.1);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -171,9 +171,8 @@
     gap: 1rem;
 }
 
-/* Chart Container */
+/* Chart Container - uses the responsive height from common.css */
 .chart-container {
-    /* Use common.css responsive settings */
     width: 100%;
     margin: 20px 0;
     display: flex;
@@ -235,7 +234,7 @@
 }
 
 .btn-timeframe:hover {
-    background-color: rgba(var(--primary-color), 0.1);
+    background-color: rgba(var(--primary-color-rgb), 0.1);
     color: var(--primary-color);
     border-color: var(--primary-color);
 }
@@ -341,5 +340,25 @@
     .crypto-list {
         max-height: 50vh;
         min-height: 150px;
+    }
+}
+
+/* On the two-column desktop layout the chart panel is the taller card and drives
+   the row height. Give the Market Overview list a flex-basis of 0 so its items
+   don't push the card taller than the chart panel; it then fills the matched
+   height exactly (scrolling if needed) with no empty space in either box. */
+@media (min-width: 992px) {
+    .crypto-list-panel .card-body {
+        display: flex;
+        flex-direction: column;
+        flex: 1 1 0;
+        min-height: 0;
+        max-height: none;
+    }
+
+    .crypto-list-panel .crypto-list {
+        flex: 1 1 0;
+        min-height: 0;
+        max-height: none;
     }
 }
