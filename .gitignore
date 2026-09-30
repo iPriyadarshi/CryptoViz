@@ -1,17 +1,30 @@
 # Environment / secrets
 .env
 
-# Local SQLite database (used when Turso is not configured)
+# Local SQLite database and its WAL sidecar files
 crypto.db
 *.db
+*.db-wal
+*.db-shm
 
 # Python
 __pycache__/
 *.py[cod]
 *.egg-info/
+build/
+dist/
 .venv/
 venv/
 env/
+
+# uv
+.uv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # OS / editor
 .DS_Store
