@@ -173,31 +173,7 @@ async function fetchCorrelationData() {
 
         if (!response.ok) {
             const errorText = await response.text();
-
-            // Try the test endpoint as a fallback
-
-            try {
-                const testResponse = await fetch(`${API_BASE_URL}/api/test/correlation`);
-                if (testResponse.ok) {
-                    const testData = await testResponse.json();
-
-                    // Validate test data
-                    if (testData && testData.correlation_matrix && Array.isArray(testData.correlation_matrix) &&
-                        testData.correlation_matrix.length > 0 && testData.symbols && Array.isArray(testData.symbols)) {
-
-                        // Process test data
-                        processCorrelationData(testData);
-                        return;
-                    } else {
-                        throw new Error('Invalid test data format');
-                    }
-                } else {
-                    throw new Error(`Test endpoint failed with status: ${testResponse.status}`);
-                }
-            } catch (testError) {
-
-                throw new Error(`API error: ${response.status}. Test endpoint also failed: ${testError.message}`);
-            }
+            throw new Error(`API error ${response.status}: ${errorText}`);
         }
 
         // Parse the JSON response

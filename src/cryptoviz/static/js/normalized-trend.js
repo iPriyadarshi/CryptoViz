@@ -70,35 +70,34 @@ document.addEventListener('DOMContentLoaded', function() {
     }, 1000);
 });
 
-// Update fetchHistoricalData to accept a time range
+/**
+ * Number of days of history each time-range button represents.
+ */
+const TIME_RANGE_DAYS = {
+    '24h': 1,
+    '7d': 7,
+    '1m': 30,
+    '3m': 90,
+    '1y': 365
+};
+
+/**
+ * Fetch one symbol's history for the selected range.
+ *
+ * The window is applied server-side. This page charts ten symbols at once, so
+ * fetching full history and trimming here would mean downloading roughly a
+ * million points to draw a few hundred.
+ */
 async function fetchHistoricalData(symbol, timeRange) {
-    const response = await fetch(`${apiUrl}/${symbol}/history`);
+    const days = TIME_RANGE_DAYS[timeRange] || 1;
+    const response = await fetch(`${apiUrl}/${symbol}/history?days=${days}`);
     const data = await response.json();
 
-    // Filter data based on the selected time range
-    const currentTime = new Date();
-    let cutoffTime;
-
-    if (timeRange === '24h') {
-        cutoffTime = new Date(currentTime.getTime() - 24 * 60 * 60 * 1000);
-    } else if (timeRange === '7d') {
-        cutoffTime = new Date(currentTime.getTime() - 7 * 24 * 60 * 60 * 1000);
-    } else if (timeRange === '1m') {
-        cutoffTime = new Date(currentTime.getTime() - 30 * 24 * 60 * 60 * 1000);
-    }
-
-    const filteredTimestamps = [];
-    const filteredPrices = [];
-
-    for (let i = 0; i < data.timestamps.length; i++) {
-        const timestamp = new Date(data.timestamps[i]);
-        if (timestamp >= cutoffTime && timestamp <= currentTime) { // Ensure timestamps are within the range
-            filteredTimestamps.push(data.timestamps[i]);
-            filteredPrices.push(data.prices[i]);
-        }
-    }
-
-    return { symbol, timestamps: filteredTimestamps, prices: filteredPrices };
+    return {
+        symbol,
+        timestamps: data.timestamps || [],
+        prices: data.prices || []
+    };
 }
 
 // Add event listeners for time range selection

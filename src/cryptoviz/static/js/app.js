@@ -328,72 +328,40 @@ function updatePriceChangeBadge(change) {
     }
 }
 
+/**
+ * Number of days of history each timeframe button represents.
+ *
+ * The server windows and downsamples using this, so the browser never receives
+ * more points than it can draw - a year of 5-minute data is ~105,000 rows per
+ * symbol, which is why this is a server-side concern rather than a filter here.
+ */
+const TIMEFRAME_DAYS = {
+    '24h': 1,
+    '7d': 7,
+    '1m': 30,
+    '3m': 90,
+    '1y': 365
+};
+
 async function fetchHistoricalData(symbol, timeframe = '24h') {
     const chartCanvas = document.getElementById('priceChart');
     showChartLoading(chartCanvas);
 
     try {
-        const response = await fetch(`${API_BASE_URL}/api/crypto/${symbol}/history`);
+        const days = TIMEFRAME_DAYS[timeframe] || 1;
+        const response = await fetch(
+            `${API_BASE_URL}/api/crypto/${symbol}/history?days=${days}`
+        );
         if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
 
         const data = await response.json();
 
-        // Filter data based on the selected timeframe
-        const currentTime = new Date();
-        let cutoffTime;
-
-        if (timeframe === '24h') {
-            cutoffTime = new Date(currentTime.getTime() - 24 * 60 * 60 * 1000);
-        } else if (timeframe === '7d') {
-            cutoffTime = new Date(currentTime.getTime() - 7 * 24 * 60 * 60 * 1000);
-        } else if (timeframe === '1m') {
-            cutoffTime = new Date(currentTime.getTime() - 30 * 24 * 60 * 60 * 1000);
-        }
-
-        const filteredTimestamps = [];
-        const filteredPrices = [];
-
-        // First pass: filter by timeframe
-        for (let i = 0; i < data.timestamps.length; i++) {
-            const timestamp = new Date(data.timestamps[i]);
-            if (timestamp >= cutoffTime && timestamp <= currentTime) {
-                filteredTimestamps.push(data.timestamps[i]);
-                filteredPrices.push(data.prices[i]);
-            }
-        }
-
-        // Second pass: ensure we don't have long periods with the same price
-        // by adding intermediate points if needed
-        const finalTimestamps = [];
-        const finalPrices = [];
-
-        if (filteredTimestamps.length > 0) {
-            // Always include the first point
-            finalTimestamps.push(filteredTimestamps[0]);
-            finalPrices.push(filteredPrices[0]);
-
-            // Process the rest of the points
-            for (let i = 1; i < filteredTimestamps.length; i++) {
-                const currentTime = new Date(filteredTimestamps[i]);
-                const prevTime = new Date(finalTimestamps[finalTimestamps.length - 1]);
-                const timeDiff = (currentTime - prevTime) / (1000 * 60); // Time difference in minutes
-
-                // If more than 15 minutes have passed with the same price, add intermediate points
-                if (timeDiff > 15 && filteredPrices[i] === finalPrices[finalPrices.length - 1]) {
-                    // Add an intermediate point at 5 minutes after the previous point
-                    const intermediateTime = new Date(prevTime.getTime() + 5 * 60 * 1000);
-                    finalTimestamps.push(intermediateTime.toISOString().replace('T', ' ').substring(0, 19));
-                    finalPrices.push(filteredPrices[i]);
-                }
-
-                // Always include the current point
-                finalTimestamps.push(filteredTimestamps[i]);
-                finalPrices.push(filteredPrices[i]);
-            }
-        }
-
-
-        updatePriceChart({ timestamps: finalTimestamps, prices: finalPrices }, timeframe);
+        // The response is already restricted to the requested window and
+        // thinned out, so it can be charted as received.
+        updatePriceChart(
+            { timestamps: data.timestamps || [], prices: data.prices || [] },
+            timeframe
+        );
     } catch (error) {
 
         showChartError(chartCanvas, 'Failed to load historical data');
@@ -435,9 +403,12 @@ function updatePriceChart(historyData, timeframe) {
             case '24h':
                 return date.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
             case '7d':
-                return date.toLocaleDateString([], {month: 'short', day: 'numeric'});
             case '1m':
+            case '3m':
                 return date.toLocaleDateString([], {month: 'short', day: 'numeric'});
+            case '1y':
+                // Over a year the day is noise; month and year carry the shape.
+                return date.toLocaleDateString([], {month: 'short', year: '2-digit'});
             default:
                 return date.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
         }

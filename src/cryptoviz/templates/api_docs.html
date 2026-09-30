@@ -51,7 +51,11 @@
     
     <div class="endpoint">
         <p><span class="method">GET</span> <code>/api/crypto/{symbol}/history</code></p>
-        <p>Get historical price data for a specific cryptocurrency.</p>
+        <p>Get historical price data for a specific cryptocurrency.
+           Accepts <code>?days=</code> (1, 7, 14, 30, 90 or 365; default 1).
+           Windows longer than a week are averaged into hourly points, and
+           longer than 90 days into daily points, so a one-year request returns
+           a few hundred readings rather than the ~105,000 stored.</p>
     </div>
     
     <div class="endpoint">

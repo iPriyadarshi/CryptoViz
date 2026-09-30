@@ -6,6 +6,30 @@ let sentimentGaugeChart;
 let sentimentTrendChart;
 let chartResizeObserver = null;
 let selectedTimeRange = '24h';
+
+/**
+ * Number of days each time-range button represents.
+ *
+ * Must stay within the set the API accepts (see ALLOWED_WINDOW_DAYS in
+ * config.py); an unlisted value silently falls back to the endpoint default.
+ */
+const RANGE_DAYS = {
+    '24h': 1,
+    '7d': 7,
+    '30d': 30,
+    '90d': 90,
+    '1y': 365
+};
+
+/**
+ * Translate a time-range button value into a day count.
+ *
+ * @param {string} range - the button's data-range value
+ * @returns {number} days of history to request
+ */
+function daysForRange(range) {
+    return RANGE_DAYS[range] || 1;
+}
 let selectedCrypto = 'BTC'; // Default to Bitcoin instead of 'all'
 let selectedSource = 'all';
 
@@ -224,8 +248,7 @@ function loadSentimentData() {
         });
 
     // Create promises for all API calls
-    // Determine days parameter for overall sentiment based on selected time range
-    const overallDays = selectedTimeRange === '24h' ? 1 : selectedTimeRange === '7d' ? 7 : 30;
+    const overallDays = daysForRange(selectedTimeRange);
 
     // Add days parameter to overall sentiment API call
     const overallPromise = fetch(`${API_BASE_URL}/api/sentiment/overall?days=${overallDays}`)
@@ -254,8 +277,7 @@ function loadSentimentData() {
             return response.json();
         });
 
-    // Determine days parameter based on selected time range
-    const days = selectedTimeRange === '24h' ? 1 : selectedTimeRange === '7d' ? 7 : 30;
+    const days = daysForRange(selectedTimeRange);
 
     // Build the URL for trends API
     let trendsUrl = `${API_BASE_URL}/api/sentiment/trends?days=${days}&symbol=${selectedCrypto}`;
