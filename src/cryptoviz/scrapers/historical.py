@@ -1,14 +1,29 @@
-import requests
-import pandas as pd
-import time
-import numpy as np
-from datetime import datetime, timedelta
+"""
+One-off historical price backfill.
+
+Fetches 31 days of 5-minute-resolution price history from CoinGecko for the
+tracked coins and writes it into the crypto_prices table, so that volatility and
+correlation have data to work with before the live scraper has accumulated any.
+
+CoinGecko rate-limits aggressively on the free tier, so requests are chunked by
+week and deliberately paced; a full run takes several minutes.
+
+Run it with:  uv run cryptoviz-backfill
+"""
+
 import logging
+import time
+from datetime import datetime, timedelta
 
-import database as db
+import numpy as np
+import pandas as pd
+import requests
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+from .. import config
+from ..db import engine as db_engine
+from ..db import repository as db
+
+logger = logging.getLogger(__name__)
 
 # CoinGecko coin IDs mapped to symbols (lowercase as requested)
 COINS = {
@@ -21,7 +36,7 @@ COINS = {
     "usd-coin": "usdc",
     "dogecoin": "doge",
     "tron": "trx",
-    "cardano": "ada"
+    "cardano": "ada",
 }
 
 # Names as shown in the example
@@ -35,23 +50,43 @@ COIN_NAMES = {
     "usdc": "USDC",
     "doge": "Dogecoin",
     "trx": "TRON",
-    "ada": "Cardano"
+    "ada": "Cardano",
 }
+
 
 def find_closest_timestamp(target_ts, timestamps_list):
     timestamps_array = np.array([ts[0] for ts in timestamps_list])
     idx = (np.abs(timestamps_array - target_ts)).argmin()
     return idx
 
-def get_historical_crypto_data():
+
+def get_historical_crypto_data(days=None, interval_minutes=None):
+    """
+    Fetch historical prices for every tracked coin.
+
+    Args:
+        days (int, optional): How far back to reach. Defaults to the
+            configured price retention window.
+        interval_minutes (int, optional): Spacing of the sampled series.
+            Defaults to 5 for short windows and 60 for long ones, because
+            CoinGecko's free tier only returns 5-minute granularity for
+            about a day - asking for finer spacing over a year just
+            resamples the same hourly points.
+
+    Returns:
+        list[dict]: price rows ready for the database.
+    """
+    if days is None:
+        days = config.PRICE_RETENTION_DAYS
+    if interval_minutes is None:
+        interval_minutes = 5 if days <= 31 else 60
+
     end_time = datetime.now()
-    start_time = end_time - timedelta(days=31)
+    start_time = end_time - timedelta(days=days)
 
     end_time = end_time.replace(second=0, microsecond=0)
-    minute_remainder = end_time.minute % 5
+    minute_remainder = end_time.minute % interval_minutes
     end_time = end_time - timedelta(minutes=minute_remainder)
-
-    interval_minutes = 5
     time_intervals = []
     current_time = end_time
     while current_time >= start_time:
@@ -63,12 +98,12 @@ def get_historical_crypto_data():
     total_intervals = len(time_intervals)
     collection_intervals = time_intervals
 
-    logging.info(f"Collecting {total_intervals} intervals at 5-minute frequency")
+    logger.info(f"Collecting {total_intervals} intervals at 5-minute frequency")
 
     all_data = []
 
     for coin_id, symbol in COINS.items():
-        logging.info(f"Processing {coin_id}...")
+        logger.info(f"Processing {coin_id}...")
 
         time.sleep(15)
 
@@ -84,17 +119,15 @@ def get_historical_crypto_data():
             chunk_from_ts = int(chunk_start.timestamp())
             chunk_to_ts = int(chunk_end.timestamp())
 
-            logging.info(f"Fetching data for period: {chunk_start.strftime('%Y-%m-%d')} to {chunk_end.strftime('%Y-%m-%d')}")
+            logger.info(
+                f"Fetching data for period: {chunk_start.strftime('%Y-%m-%d')} to {chunk_end.strftime('%Y-%m-%d')}"
+            )
 
             url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart/range"
             headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
             }
-            params = {
-                "vs_currency": "usd",
-                "from": chunk_from_ts,
-                "to": chunk_to_ts
-            }
+            params = {"vs_currency": "usd", "from": chunk_from_ts, "to": chunk_to_ts}
 
             try:
                 response = requests.get(url, headers=headers, params=params)
@@ -110,18 +143,18 @@ def get_historical_crypto_data():
                 all_volumes.extend(chunk_volumes)
 
                 if chunk_end < end_time:
-                    logging.info("Waiting between chunks...")
+                    logger.info("Waiting between chunks...")
                     time.sleep(10)
 
                 chunk_start = chunk_end
 
             except requests.exceptions.RequestException as e:
-                logging.error(f"Error fetching data: {e}")
+                logger.error(f"Error fetching data: {e}")
                 time.sleep(60)
 
                 try:
                     retry_headers = {
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.131 Safari/537.36 Edg/92.0.902.73'
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.131 Safari/537.36 Edg/92.0.902.73"
                     }
                     response = requests.get(url, headers=retry_headers, params=params)
                     response.raise_for_status()
@@ -138,7 +171,7 @@ def get_historical_crypto_data():
                     chunk_start = chunk_end
 
                 except Exception as retry_error:
-                    logging.error(f"Error fetching data after retry: {retry_error}")
+                    logger.error(f"Error fetching data after retry: {retry_error}")
                     chunk_start = chunk_end
                     continue
 
@@ -147,7 +180,7 @@ def get_historical_crypto_data():
         volumes = all_volumes
 
         if not prices:
-            logging.warning(f"No price data available for {coin_id}")
+            logger.warning(f"No price data available for {coin_id}")
             continue
 
         try:
@@ -176,41 +209,54 @@ def get_historical_crypto_data():
                     if abs(prices[day_ago_idx][0] - day_ago_ts) <= 30 * 60 * 1000:
                         price_24h_ago = prices[day_ago_idx][1]
                         if price_24h_ago > 0:
-                            percent_change_24h = ((price - price_24h_ago) / price_24h_ago) * 100
+                            percent_change_24h = (
+                                (price - price_24h_ago) / price_24h_ago
+                            ) * 100
 
-                ts_str = interval_time.strftime('%Y-%m-%d %H:%M:%S')
+                ts_str = interval_time.strftime("%Y-%m-%d %H:%M:%S")
 
-                all_data.append({
-                    "symbol": symbol,
-                    "name": COIN_NAMES[symbol],
-                    "price": price,
-                    "market_cap": round(market_cap, 2),
-                    "volume_24h": round(volume, 2),
-                    "percent_change_24h": round(percent_change_24h, 2) if percent_change_24h is not None else None,
-                    "timestamp": ts_str
-                })
+                all_data.append(
+                    {
+                        "symbol": symbol,
+                        "name": COIN_NAMES[symbol],
+                        "price": price,
+                        "market_cap": round(market_cap, 2),
+                        "volume_24h": round(volume, 2),
+                        "percent_change_24h": round(percent_change_24h, 2)
+                        if percent_change_24h is not None
+                        else None,
+                        "timestamp": ts_str,
+                    }
+                )
 
-            logging.info(f"Finished processing {coin_id}")
+            logger.info(f"Finished processing {coin_id}")
 
         except Exception as e:
-            logging.error(f"Error processing data for {coin_id}: {e}")
+            logger.error(f"Error processing data for {coin_id}: {e}")
 
     return all_data
 
-def main():
-    crypto_data = get_historical_crypto_data()
+
+def main(days=None):
+    """Fetch the historical window and persist it to the database."""
+    crypto_data = get_historical_crypto_data(days=days)
+
+    if not crypto_data:
+        logger.error("No historical data collected; nothing was written")
+        return 1
 
     df = pd.DataFrame(crypto_data)
+    df["percent_change_24h"] = df["percent_change_24h"].fillna(0)
+    df = df.sort_values(by=["timestamp", "symbol"])
 
-    df['percent_change_24h'] = df['percent_change_24h'].fillna(0)
-
-    df = df.sort_values(by=['timestamp', 'symbol'])
-
-    # Persist the backfilled history to the database (replaces crypto_data.csv).
-    db.init_db()
+    db_engine.init_db()
     records = df.to_dict("records")
     db.save_prices(records)
-    logging.info(f"Saved {len(records)} historical price records to the database")
+    logger.info("Saved %d historical price records to the database", len(records))
 
-if __name__ == "__main__":
-    main()
+    # The backfill inserts history behind the current time, which the
+    # worker's short trailing refresh would never reach - rebuild in full.
+    logger.info("Rebuilding price rollups over the backfilled range")
+    written = db.refresh_price_buckets()
+    logger.info("Rollup buckets written: %s", written)
+    return 0

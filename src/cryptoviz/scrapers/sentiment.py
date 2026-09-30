@@ -10,24 +10,47 @@ The module collects data from multiple sources, processes it to extract sentimen
 and aggregates it into a comprehensive sentiment analysis report.
 """
 
+import logging
+from datetime import datetime, timedelta
+
+import nltk
 import requests
 from bs4 import BeautifulSoup
-import json
-from datetime import datetime, timedelta
-import nltk
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
-import database as db
+from .. import config
+from ..db import repository as db
+from .base import DEFAULT_USER_AGENT
 
-# Download NLTK resources if not already downloaded
-# VADER (Valence Aware Dictionary and sEntiment Reasoner) is used for sentiment analysis
-try:
-    nltk.data.find("vader_lexicon")  # Check if VADER lexicon is already downloaded
-except LookupError:
-    nltk.download("vader_lexicon")  # Download if not available
+logger = logging.getLogger(__name__)
 
-# Initialize VADER sentiment intensity analyzer
-# This will be used to calculate sentiment scores for text content
+
+def _ensure_vader_lexicon():
+    """
+    Make sure the VADER lexicon is available, downloading it only if missing.
+
+    The resource has to be looked up by its real path ("sentiment/vader_lexicon"),
+    not by bare name - a bare name never resolves, so the check would report the
+    lexicon missing and re-download it on every process start.
+    """
+    try:
+        nltk.data.find("sentiment/vader_lexicon.zip")
+        return
+    except LookupError:
+        pass
+
+    try:
+        nltk.data.find("sentiment/vader_lexicon")
+        return
+    except LookupError:
+        logger.info("VADER lexicon not found locally; downloading it")
+        nltk.download("vader_lexicon", quiet=True)
+
+
+_ensure_vader_lexicon()
+
+# VADER (Valence Aware Dictionary and sEntiment Reasoner) scores the text
+# collected from news articles and Reddit posts.
 sia = SentimentIntensityAnalyzer()
 
 
@@ -48,9 +71,7 @@ class SentimentScraper:
         and initializes data structures for storing sentiment information.
         """
         # Browser-like user agent to avoid being blocked by websites
-        self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-        }
+        self.headers = {"User-Agent": DEFAULT_USER_AGENT}
 
         # List of cryptocurrency symbols to track
         self.crypto_symbols = [
@@ -127,7 +148,7 @@ class SentimentScraper:
             url = "https://alternative.me/crypto/fear-and-greed-index/"
 
             # Make the HTTP request
-            response = requests.get(url, headers=self.headers)
+            response = requests.get(url, headers=self.headers, timeout=15)
 
             # Parse the HTML content
             soup = BeautifulSoup(response.text, "html.parser")
@@ -222,9 +243,7 @@ class SentimentScraper:
 
         # If we still don't have enough articles, try additional backup sources
         if total_collected < limit:
-            additional_items = self._try_additional_news_sources(
-                limit - total_collected
-            )
+            additional_items = self._try_additional_news_sources(limit - total_collected)
             if additional_items:
                 news_items.extend(additional_items)
                 total_collected += len(additional_items)
@@ -357,9 +376,7 @@ class SentimentScraper:
                         self.sentiment_data["crypto_specific"][crypto][
                             "sentiment_scores"
                         ].append(normalized_score)
-                        self.sentiment_data["crypto_specific"][crypto][
-                            "sources"
-                        ].append(
+                        self.sentiment_data["crypto_specific"][crypto]["sources"].append(
                             {
                                 "type": "news",
                                 "title": title,
@@ -465,9 +482,7 @@ class SentimentScraper:
                         description = desc_elem.text.strip() if desc_elem else ""
 
                         # Clean up description (remove HTML)
-                        description = BeautifulSoup(
-                            description, "html.parser"
-                        ).get_text()
+                        description = BeautifulSoup(description, "html.parser").get_text()
 
                         # Extract source
                         source_name = "Crypto News"
@@ -480,12 +495,8 @@ class SentimentScraper:
 
                         # Analyze sentiment
                         text_to_analyze = title + " " + description
-                        sentiment_score = sia.polarity_scores(text_to_analyze)[
-                            "compound"
-                        ]
-                        normalized_score = self.normalize_sentiment_score(
-                            sentiment_score
-                        )
+                        sentiment_score = sia.polarity_scores(text_to_analyze)["compound"]
+                        normalized_score = self.normalize_sentiment_score(sentiment_score)
 
                         # Determine which cryptocurrencies are mentioned
                         mentioned_cryptos = []
@@ -559,7 +570,7 @@ class SentimentScraper:
             url = f"https://old.reddit.com/r/{subreddit}/hot/"
 
             # Make the HTTP request
-            response = requests.get(url, headers=self.headers)
+            response = requests.get(url, headers=self.headers, timeout=15)
 
             # Parse the HTML content
             soup = BeautifulSoup(response.text, "html.parser")
@@ -642,9 +653,7 @@ class SentimentScraper:
                         ].append(normalized_score)
 
                         # Add source reference for this crypto
-                        self.sentiment_data["crypto_specific"][crypto][
-                            "sources"
-                        ].append(
+                        self.sentiment_data["crypto_specific"][crypto]["sources"].append(
                             {
                                 "type": "reddit",
                                 "title": title,
@@ -725,7 +734,9 @@ class SentimentScraper:
                 "social_sentiment": social_sentiment,  # Reddit sentiment
                 "news_sentiment": news_sentiment,  # News sentiment
                 "fear_greed_index": fear_greed,  # Fear & Greed Index
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),  # Current timestamp
+                "timestamp": datetime.now().strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),  # Current timestamp
             }
 
             return overall_sentiment
@@ -795,9 +806,7 @@ class SentimentScraper:
             )
 
             # Sort the negative rankings by score (lowest first)
-            rankings["negative"] = sorted(
-                rankings["negative"], key=lambda x: x["score"]
-            )
+            rankings["negative"] = sorted(rankings["negative"], key=lambda x: x["score"])
 
             # Limit each category to the top 5 cryptocurrencies
             rankings["positive"] = rankings["positive"][:5]
@@ -810,7 +819,7 @@ class SentimentScraper:
         except Exception:
             return {"positive": [], "negative": []}  # Return empty rankings on error
 
-    def cleanup_old_sentiment_data(self, max_age_days=30):
+    def cleanup_old_sentiment_data(self, max_age_days=None):
         """
         Clean up old sentiment snapshots from the database.
 
@@ -818,12 +827,16 @@ class SentimentScraper:
         maximum age in days.
 
         Args:
-            max_age_days (int, optional): Maximum age of snapshots to keep in days. Defaults to 30.
+            max_age_days (int, optional): Maximum age of snapshots to keep in
+                days. Defaults to the configured retention window.
 
         Returns:
             int: The number of snapshots removed.
         """
-        # Calculate the cutoff time
+        # Fall back to the configured retention window when not specified.
+        if max_age_days is None:
+            max_age_days = config.SENTIMENT_RETENTION_DAYS
+
         cutoff_time = datetime.now() - timedelta(days=max_age_days)
 
         # Remove old snapshots and return how many were deleted
@@ -880,12 +893,12 @@ class SentimentScraper:
 
                 # Update the crypto-specific data with filtered lists
                 if new_scores or new_sources:
-                    self.sentiment_data["crypto_specific"][crypto][
-                        "sentiment_scores"
-                    ] = new_scores
-                    self.sentiment_data["crypto_specific"][crypto][
-                        "sources"
-                    ] = new_sources
+                    self.sentiment_data["crypto_specific"][crypto]["sentiment_scores"] = (
+                        new_scores
+                    )
+                    self.sentiment_data["crypto_specific"][crypto]["sources"] = (
+                        new_sources
+                    )
 
             return True
         except Exception:
@@ -915,7 +928,7 @@ class SentimentScraper:
 
             # Clean up old sentiment snapshots (older than 30 days)
             try:
-                self.cleanup_old_sentiment_data(30)
+                self.cleanup_old_sentiment_data()
             except Exception:
                 pass
 
@@ -984,26 +997,3 @@ class SentimentScraper:
             pass
 
         return self.sentiment_data
-
-
-# Main execution block - runs when the script is executed directly
-if __name__ == "__main__":
-    """
-    Main execution block for running the sentiment scraper as a standalone script.
-
-    When this script is run directly (not imported as a module), this section:
-    1. Creates a SentimentScraper instance
-    2. Runs the complete scraping process
-    3. Prints the resulting sentiment data as formatted JSON
-
-    This is useful for testing the scraper or running it manually outside
-    of the main application.
-    """
-    # Create a sentiment scraper instance
-    scraper = SentimentScraper()
-
-    # Run the complete scraping process
-    sentiment_data = scraper.run_scraper()
-
-    # Print the resulting sentiment data as formatted JSON
-    print(json.dumps(sentiment_data, indent=4))
