@@ -1,0 +1,51 @@
+[Unit]
+Description=CryptoViz web server (gunicorn)
+Documentation=https://github.com/iPriyadarshi/CryptoViz
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=cryptoviz
+Group=cryptoviz
+WorkingDirectory=/opt/cryptoviz
+
+# Runtime directory for the gunicorn unix socket. systemd creates
+# /run/cryptoviz at start and removes it on stop.
+RuntimeDirectory=cryptoviz
+RuntimeDirectoryMode=0755
+
+Environment="PATH=/opt/cryptoviz/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+# NLTK data is installed system-wide by the bootstrap script so the service does
+# not try to download the VADER lexicon at startup.
+Environment="NLTK_DATA=/usr/local/share/nltk_data"
+EnvironmentFile=/opt/cryptoviz/.env
+
+ExecStart=/opt/cryptoviz/.venv/bin/gunicorn \
+    --config /opt/cryptoviz/deploy/gunicorn.conf.py \
+    cryptoviz.wsgi:app
+
+ExecReload=/bin/kill -s HUP $MAINPID
+KillMode=mixed
+TimeoutStopSec=30
+
+Restart=always
+RestartSec=5
+
+# --- Hardening -------------------------------------------------------------
+# The service needs to read its code and write its database; nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+# The only writable path: the SQLite database directory.
+ReadWritePaths=/var/lib/cryptoviz
+
+[Install]
+WantedBy=multi-user.target

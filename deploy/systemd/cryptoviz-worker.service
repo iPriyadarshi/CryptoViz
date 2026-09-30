@@ -1,0 +1,41 @@
+[Unit]
+Description=CryptoViz scraper worker (price, sentiment, top gainers)
+Documentation=https://github.com/iPriyadarshi/CryptoViz
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cryptoviz
+Group=cryptoviz
+WorkingDirectory=/opt/cryptoviz
+
+Environment="PATH=/opt/cryptoviz/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="NLTK_DATA=/usr/local/share/nltk_data"
+EnvironmentFile=/opt/cryptoviz/.env
+
+ExecStart=/opt/cryptoviz/.venv/bin/cryptoviz-worker
+
+# The worker handles SIGTERM by letting each loop finish its current cycle, so
+# give it room to land a write in progress rather than killing it mid-scrape.
+KillSignal=SIGTERM
+TimeoutStopSec=45
+
+Restart=always
+RestartSec=15
+
+# --- Hardening -------------------------------------------------------------
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+ReadWritePaths=/var/lib/cryptoviz
+
+[Install]
+WantedBy=multi-user.target
