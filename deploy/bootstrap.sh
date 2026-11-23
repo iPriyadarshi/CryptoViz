@@ -132,14 +132,18 @@ systemctl daemon-reload
 # nginx
 # ---------------------------------------------------------------------------
 log "Installing the nginx site"
+# An existing site is left alone: certbot edits it in place, so overwriting it
+# on a re-run would drop the domain and TLS configuration.
 if [[ -d /etc/nginx/sites-available ]]; then
-    install -m 644 "$APP_DIR/deploy/nginx/cryptoviz.conf" \
-            /etc/nginx/sites-available/cryptoviz
+    if [[ ! -f /etc/nginx/sites-available/cryptoviz ]]; then
+        install -m 644 "$APP_DIR/deploy/nginx/cryptoviz.conf" \
+                /etc/nginx/sites-available/cryptoviz
+    fi
     ln -sf /etc/nginx/sites-available/cryptoviz \
            /etc/nginx/sites-enabled/cryptoviz
     # The default site also listens on :80 and would shadow ours.
     rm -f /etc/nginx/sites-enabled/default
-else
+elif [[ ! -f /etc/nginx/conf.d/cryptoviz.conf ]]; then
     install -m 644 "$APP_DIR/deploy/nginx/cryptoviz.conf" \
             /etc/nginx/conf.d/cryptoviz.conf
 fi

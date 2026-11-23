@@ -285,26 +285,28 @@ aws s3 sync /var/backups/cryptoviz s3://your-bucket/cryptoviz-backups/
 
 ## 7. HTTPS (recommended for a public site)
 
-With a domain pointed at the instance's public IP:
+The site can run on a free [DuckDNS](https://www.duckdns.org) subdomain:
+
+1. Allocate an **Elastic IP** and associate it with the instance. A plain public
+   IP changes whenever the instance stops, which would break the domain.
+2. Open ports **80 and 443** to `0.0.0.0/0` in the security group. Let's Encrypt
+   validates over port 80.
+3. Sign in at duckdns.org, create a subdomain and set its IPv4 address to the
+   Elastic IP.
+4. On the instance (Ubuntu), run:
 
 ```bash
-sudo apt-get install -y certbot python3-certbot-nginx
-
-# Put your domain in the nginx config first
-sudo nano /etc/nginx/sites-available/cryptoviz   # server_name example.com;
-sudo nginx -t && sudo systemctl reload nginx
-
-sudo certbot --nginx -d example.com
+sudo bash /opt/cryptoviz/deploy/setup-https.sh <name>.duckdns.org you@example.com
 ```
 
-certbot edits the nginx site to serve TLS and redirect HTTP, and installs a
-renewal timer. Verify renewal works:
+The script confirms the DNS record points at this instance, obtains the
+certificate, redirects HTTP to HTTPS, and verifies renewal and the health check.
+certbot edits the nginx site in place and installs a renewal timer; re-running
+`bootstrap.sh` keeps those edits. The email receives certificate notices, and
+running the script accepts the Let's Encrypt terms.
 
-```bash
-sudo certbot renew --dry-run
-```
-
-Then open port 443 in the security group.
+With an Elastic IP the record never needs updating, so no DuckDNS token or
+updater job is stored on the instance.
 
 ---
 
