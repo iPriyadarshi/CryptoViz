@@ -10,8 +10,10 @@ busy timeout so the loser of a write race waits instead of immediately raising
 
 import logging
 import sqlite3
+import time
 
 from sqlalchemy import create_engine, event
+from sqlalchemy.exc import OperationalError
 
 from .. import config
 from .models import metadata
@@ -85,6 +87,54 @@ def get_engine():
     return _engine
 
 
+def _migrate_price_index(conn):
+    """Replace the old non-unique price index, dropping any duplicate rows."""
+    legacy = conn.exec_driver_sql(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type = 'index' AND name = 'ix_crypto_prices_symbol_ts'"
+    ).first()
+    if legacy is None:
+        return
+
+    conn.exec_driver_sql(
+        "DELETE FROM crypto_prices WHERE id NOT IN "
+        "(SELECT MAX(id) FROM crypto_prices GROUP BY symbol, timestamp)"
+    )
+    conn.exec_driver_sql(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_crypto_prices_symbol_ts "
+        "ON crypto_prices (symbol, timestamp)"
+    )
+    conn.exec_driver_sql("DROP INDEX ix_crypto_prices_symbol_ts")
+
+
+def _migrate_price_buckets(conn):
+    """Add the close, low and high columns to an existing rollup table."""
+    existing = {
+        row[1] for row in conn.exec_driver_sql("PRAGMA table_info(price_buckets)")
+    }
+    for column in ("close", "low", "high"):
+        if column not in existing:
+            conn.exec_driver_sql(f"ALTER TABLE price_buckets ADD COLUMN {column} FLOAT")
+
+
 def init_db():
-    """Create all tables if they do not already exist."""
-    metadata.create_all(get_engine())
+    """
+    Create all tables if they do not already exist and apply migrations.
+
+    The web and worker processes both call this at startup, so the work runs
+    under SQLite's write lock, with a retry for the moment a fresh file is being
+    switched to WAL and the busy timeout does not apply.
+    """
+    attempts = 5
+    for attempt in range(1, attempts + 1):
+        try:
+            with get_engine().begin() as conn:
+                conn.exec_driver_sql("BEGIN IMMEDIATE")
+                metadata.create_all(conn)
+                _migrate_price_index(conn)
+                _migrate_price_buckets(conn)
+            return
+        except (OperationalError, sqlite3.OperationalError) as exc:
+            if "locked" not in str(exc) or attempt == attempts:
+                raise
+            time.sleep(0.2 * attempt)

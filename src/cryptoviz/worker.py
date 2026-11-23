@@ -16,6 +16,7 @@ and busy-timeout settings that make that concurrent access safe.
 import logging
 import signal
 import threading
+import time
 
 from .db import init_db
 from .db import repository as db
@@ -23,6 +24,10 @@ from .logging_config import configure_logging
 from .services import updater
 
 logger = logging.getLogger(__name__)
+
+# Total time to wait for the loops at shutdown. Kept below the unit's
+# TimeoutStopSec so systemd never has to kill the process mid-write.
+SHUTDOWN_GRACE_SECONDS = 40
 
 
 def main():
@@ -63,8 +68,9 @@ def main():
     # Block until a signal arrives, then let each loop finish its cycle.
     stop_event.wait()
 
+    deadline = time.monotonic() + SHUTDOWN_GRACE_SECONDS
     for thread in threads:
-        thread.join(timeout=30)
+        thread.join(timeout=max(0, deadline - time.monotonic()))
 
     logger.info("Scraper worker stopped")
     return 0

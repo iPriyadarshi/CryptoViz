@@ -19,6 +19,7 @@ env/
 
 # uv
 .uv/
+.python/
 
 # Tooling caches
 .pytest_cache/

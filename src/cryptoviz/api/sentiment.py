@@ -3,17 +3,17 @@ Market sentiment endpoints.
 
 Sentiment is stored as whole JSON snapshots rather than normalized rows, so
 these handlers read the latest snapshot (or a range of them) and reshape it for
-the frontend.
+the frontend. They are read-only: the worker process owns collection.
 """
 
 import logging
-import threading
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from flask import Blueprint, jsonify, request
 
 from .. import config
 from ..db import repository as db
+from ..db.models import utc_now
 from ..services import analytics
 
 logger = logging.getLogger(__name__)
@@ -23,13 +23,16 @@ bp = Blueprint("sentiment", __name__, url_prefix="/api/sentiment")
 # Time ranges the frontend offers. Anything else falls back to the default.
 ALLOWED_DAYS = config.ALLOWED_WINDOW_DAYS
 
-# Neutral reading used when no sentiment data exists yet.
-NEUTRAL_SENTIMENT = {
-    "sentiment": 50,
-    "social_sentiment": 50,
-    "news_sentiment": 50,
-    "fear_greed_index": 50,
-}
+# Components of an overall reading. A source that was unavailable is null.
+SENTIMENT_KEYS = (
+    "sentiment",
+    "social_sentiment",
+    "news_sentiment",
+    "fear_greed_index",
+)
+
+# Most sources a single response may carry.
+MAX_SOURCES = 500
 
 _NO_DATA = {
     "error": "No sentiment data available",
@@ -72,7 +75,8 @@ def get_overall_sentiment():
     Overall market sentiment, averaged across the requested window.
 
     Query Parameters:
-        days (int, optional): 1, 7 or 30. Default 1 (the latest snapshot).
+        days (int, optional): 1, 7, 14, 30, 90 or 365. Default 1 (the latest
+            snapshot).
 
     Returns:
         JSON: sentiment, social_sentiment, news_sentiment, fear_greed_index.
@@ -82,52 +86,21 @@ def get_overall_sentiment():
 
         # A one-day window is just the newest snapshot; no averaging needed.
         if days == 1:
-            data = db.get_latest_sentiment()
+            data = db.get_latest_sentiment(source_limit=0)
             if data is None:
                 return jsonify(_NO_DATA), 404
             return jsonify(data.get("overall", {}))
 
-        cutoff = datetime.now() - timedelta(days=days)
-        snapshots = db.get_sentiment_snapshots_since(cutoff)
+        cutoff = utc_now() - timedelta(days=days)
+        averages = db.get_sentiment_averages(cutoff, SENTIMENT_KEYS)
 
-        if not snapshots:
-            data = db.get_latest_sentiment()
-            if data is not None:
-                return jsonify(data.get("overall", {}))
-            return jsonify(
-                {
-                    **NEUTRAL_SENTIMENT,
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                }
-            )
+        if averages is None:
+            data = db.get_latest_sentiment(source_limit=0)
+            if data is None:
+                return jsonify(_NO_DATA), 404
+            return jsonify(data.get("overall", {}))
 
-        # Average each component across every snapshot in the window.
-        totals = dict.fromkeys(NEUTRAL_SENTIMENT, 0)
-        count = 0
-        for _created_at, data in snapshots:
-            overall = data.get("overall") or {}
-            if not overall:
-                continue
-            for key in totals:
-                totals[key] += overall.get(key, NEUTRAL_SENTIMENT[key])
-            count += 1
-
-        if count:
-            averages = {key: total / count for key, total in totals.items()}
-        else:
-            averages = dict(NEUTRAL_SENTIMENT)
-
-        # Snapshots come back oldest-first, so the last one is the most recent.
-        latest_timestamp = snapshots[-1][0].strftime("%Y-%m-%d %H:%M:%S")
-
-        return jsonify(
-            {
-                **averages,
-                "timestamp": latest_timestamp,
-                "period": f"{days}d",
-                "data_points": count,
-            }
-        )
+        return jsonify({**averages, "period": f"{days}d"})
     except Exception:
         logger.exception("Failed to load overall sentiment")
         return jsonify({"error": "Server error"}), 500
@@ -139,7 +112,7 @@ def get_sentiment_rankings():
     Most positive and most negative cryptocurrencies by sentiment.
 
     Query Parameters:
-        days (int, optional): 1, 7 or 30. Default 1.
+        days (int, optional): Accepted for symmetry with the other endpoints.
 
     Returns:
         JSON: {'positive': [...], 'negative': [...]}
@@ -147,25 +120,12 @@ def get_sentiment_rankings():
     empty = {"positive": [], "negative": []}
 
     try:
-        days = _requested_days()
-
-        if days == 1:
-            data = db.get_latest_sentiment()
-            if data is None:
-                return jsonify(_NO_DATA), 404
-            return jsonify(data.get("rankings", empty))
-
-        cutoff = datetime.now() - timedelta(days=days)
-        snapshots = db.get_sentiment_snapshots_since(cutoff)
-
-        if not snapshots:
-            data = db.get_latest_sentiment()
-            return jsonify(data.get("rankings", empty) if data else empty)
-
-        # Rankings are not meaningfully averageable, so use the newest snapshot
-        # that falls inside the requested window.
-        _created_at, latest_in_range = snapshots[-1]
-        return jsonify(latest_in_range.get("rankings", empty))
+        # Rankings are not meaningfully averageable, so every window shows the
+        # newest reading.
+        data = db.get_latest_sentiment(source_limit=0)
+        if data is None:
+            return jsonify(_NO_DATA), 404
+        return jsonify(data.get("rankings", empty))
     except Exception:
         logger.exception("Failed to load sentiment rankings")
         return jsonify({"error": "Server error"}), 500
@@ -184,7 +144,8 @@ def get_sentiment_sources():
     Query Parameters:
         type (str, optional): Filter by source type ('news', 'reddit').
         crypto (str, optional): Only sources mentioning this symbol.
-        limit (int, optional): Maximum number of sources to return.
+        limit (int, optional): Maximum number of sources to return, capped at
+            MAX_SOURCES (also the default).
         days (int, optional): Window size in days. Default 1.
 
     Returns:
@@ -192,7 +153,7 @@ def get_sentiment_sources():
     """
     try:
         days = _requested_days()
-        cutoff = datetime.now() - timedelta(days=days)
+        cutoff = utc_now() - timedelta(days=days)
 
         source_type = request.args.get("type")
         crypto = request.args.get("crypto")
@@ -202,7 +163,7 @@ def get_sentiment_sources():
             since=cutoff,
             source_type=source_type,
             crypto=crypto,
-            limit=limit if limit and limit > 0 else None,
+            limit=min(limit, MAX_SOURCES) if limit and limit > 0 else MAX_SOURCES,
         )
 
         # `total` is how many match before the limit, so the UI can say
@@ -223,28 +184,31 @@ def get_sentiment_trends():
     Sentiment plotted against price over time.
 
     Query Parameters:
-        days (int, optional): 1, 7 or 30. Default 7.
-        symbol (str, optional): Cryptocurrency to chart. Default 'BTC';
-            'all' uses BTC as the market proxy.
+        days (int, optional): 1, 7, 14, 30, 90 or 365. Default 7.
+        symbol (str, optional): Cryptocurrency to chart. Default 'BTC'; 'all'
+            charts overall market sentiment against the BTC price.
 
     Returns:
         JSON: {'dates': [...], 'sentiment': [...], 'price': [...]}
     """
     try:
         days = _requested_days(default=7)
-        symbol = request.args.get("symbol", default="BTC")
+        symbol = request.args.get("symbol", default="BTC").strip()
+        is_market = symbol.lower() == "all"
 
-        cutoff = datetime.now() - timedelta(days=days)
-        snapshots = db.get_sentiment_snapshots_since(cutoff)
+        # Long windows keep one snapshot per bucket, so the chart stays readable
+        # and the request does not parse a year of snapshots.
+        bucket = analytics.trend_bucket_for_window(days)
+        cutoff = utc_now() - timedelta(days=days)
+        snapshots = db.get_sentiment_snapshots_since(cutoff, bucket=bucket)
 
         trend = {"dates": [], "sentiment": [], "price": []}
         if not snapshots:
             return jsonify(trend)
 
-        # Load the price series once and look every snapshot up against it, so a
-        # 30-day request costs one query instead of one per data point.
-        price_symbol = "btc" if symbol == "all" else symbol.lower()
-        bucket = analytics.bucket_for_window(days)
+        # Load the price series once and align all snapshots against it, so a
+        # long request costs one query instead of one per data point.
+        price_symbol = "btc" if is_market else symbol.lower()
         series = analytics.get_price_series(price_symbol, since=cutoff, bucket=bucket)
 
         # Fall back to the full history if nothing was recorded in the window.
@@ -263,78 +227,34 @@ def get_sentiment_trends():
                 None,
             )
 
+        points = []
         for created_at, data in snapshots:
             try:
-                trend["dates"].append(created_at.strftime("%Y-%m-%d %H:%M"))
-
-                if symbol in ("all", "BTC"):
-                    sentiment_value = data.get("overall", {}).get("sentiment", 50)
+                if is_market:
+                    sentiment_value = data.get("overall", {}).get("sentiment")
                 else:
                     crypto_data = data.get("crypto_specific", {}).get(symbol.upper(), {})
                     scores = crypto_data.get("sentiment_scores") if crypto_data else None
-                    sentiment_value = sum(scores) / len(scores) if scores else 50
-
-                trend["sentiment"].append(sentiment_value)
-
-                price = analytics.price_at(series, created_at)
-                trend["price"].append(price if price is not None else fallback_price)
+                    sentiment_value = sum(scores) / len(scores) if scores else None
             except Exception:
                 logger.debug("Skipping malformed sentiment snapshot", exc_info=True)
                 continue
 
+            # No reading in this snapshot: leave a gap rather than plot a
+            # made-up neutral value.
+            if sentiment_value is not None:
+                points.append((created_at, sentiment_value))
+
+        if not points:
+            return jsonify(trend)
+
+        prices = analytics.prices_at(series, [created_at for created_at, _ in points])
+        for (created_at, sentiment_value), price in zip(points, prices, strict=True):
+            trend["dates"].append(created_at.strftime("%Y-%m-%d %H:%M"))
+            trend["sentiment"].append(sentiment_value)
+            trend["price"].append(price if price is not None else fallback_price)
+
         return jsonify(trend)
     except Exception:
         logger.exception("Failed to build sentiment trends")
-        return jsonify({"error": "Server error"}), 500
-
-
-@bp.route("/update", methods=["GET"])
-def trigger_sentiment_update():
-    """
-    Manually trigger a sentiment refresh.
-
-    The worker process refreshes sentiment on a schedule already; this exists so
-    the UI's refresh control can ask for an early update. Recent data is left
-    alone unless `force` is set, to keep a page reload from hammering the
-    upstream sources.
-
-    Query Parameters:
-        force (bool, optional): Update even if the data is recent.
-
-    Returns:
-        JSON: status 'success' when an update was started, 'skipped' otherwise.
-    """
-    try:
-        force = request.args.get("force", "false").lower() == "true"
-
-        latest_time = db.get_latest_sentiment_time()
-        if latest_time is not None and not force:
-            age = (datetime.now() - latest_time).total_seconds()
-            if age < config.SENTIMENT_UPDATE_INTERVAL:
-                return jsonify(
-                    {
-                        "message": (
-                            f"Sentiment data is recent (updated {int(age / 60)} "
-                            "minutes ago). Use force=true to update anyway."
-                        ),
-                        "status": "skipped",
-                    }
-                )
-
-        def run_update():
-            """Refresh sentiment off the request thread."""
-            try:
-                from ..services import updater
-
-                updater.collect_sentiment()
-            except Exception:
-                logger.exception("Manual sentiment update failed")
-
-        threading.Thread(target=run_update, daemon=True).start()
-
-        return jsonify(
-            {"message": "Sentiment data update triggered", "status": "success"}
-        )
-    except Exception:
-        logger.exception("Failed to trigger sentiment update")
         return jsonify({"error": "Server error"}), 500

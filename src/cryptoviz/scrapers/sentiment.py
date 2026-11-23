@@ -10,8 +10,13 @@ The module collects data from multiple sources, processes it to extract sentimen
 and aggregates it into a comprehensive sentiment analysis report.
 """
 
+import html
 import logging
-from datetime import datetime, timedelta
+import re
+import xml.etree.ElementTree as ElementTree
+from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
+from functools import cache
 
 import nltk
 import requests
@@ -20,6 +25,7 @@ from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 from .. import config
 from ..db import repository as db
+from ..db.models import utc_now
 from .base import DEFAULT_USER_AGENT
 
 logger = logging.getLogger(__name__)
@@ -47,11 +53,37 @@ def _ensure_vader_lexicon():
         nltk.download("vader_lexicon", quiet=True)
 
 
-_ensure_vader_lexicon()
+@cache
+def _get_analyzer():
+    """
+    Return the VADER analyzer, loading the lexicon on first use.
 
-# VADER (Valence Aware Dictionary and sEntiment Reasoner) scores the text
-# collected from news articles and Reddit posts.
-sia = SentimentIntensityAnalyzer()
+    Loaded here rather than at import, so a missing lexicon only affects
+    sentiment scoring instead of stopping the worker from collecting prices. A
+    failed load is not cached and is retried on the next scrape.
+    """
+    _ensure_vader_lexicon()
+    return SentimentIntensityAnalyzer()
+
+
+# RSS feeds carry stable markup and real publication dates, unlike the sites'
+# front pages, whose HTML changes without notice.
+NEWS_FEEDS = (
+    ("Cointelegraph", "https://cointelegraph.com/rss"),
+    ("CoinDesk", "https://coindesk.com/arc/outboundfeeds/rss/"),
+    ("Bitcoin.com", "https://news.bitcoin.com/feed/"),
+    ("CryptoNews", "https://cryptonews.com/news/feed/"),
+    ("Bitcoinist", "https://bitcoinist.com/feed/"),
+)
+
+# Older articles say little about the current market.
+MAX_ARTICLE_AGE_DAYS = 7
+
+MAX_FEED_BYTES = 5 * 1024 * 1024
+
+# Coin names that are also ordinary words. These match only when capitalized,
+# so "a ripple effect" is not read as XRP.
+AMBIGUOUS_COIN_NAMES = {"Avalanche", "Cosmos", "Polygon", "Ripple", "Stellar"}
 
 
 class SentimentScraper:
@@ -121,6 +153,17 @@ class SentimentScraper:
             "VET": "VeChain",
         }
 
+        # Tickers match as whole, uppercase words, so "whether" is not ETH and
+        # "sold" is not SOL.
+        self.mention_patterns = {
+            symbol: re.compile(
+                rf"\b{symbol}\b|\b{re.escape(name)}\b"
+                if name in AMBIGUOUS_COIN_NAMES
+                else rf"\b{symbol}\b|(?i:\b{re.escape(name)}\b)"
+            )
+            for symbol, name in self.crypto_names.items()
+        }
+
         # Initialize data structure for storing sentiment information
         self.sentiment_data = {
             "overall": {},  # Overall market sentiment metrics
@@ -130,6 +173,9 @@ class SentimentScraper:
 
         # Initialize Fear & Greed Index (will be populated during scraping)
         self.fear_greed_index = None
+
+        # Whether this run stored a snapshot
+        self.saved = False
 
     def scrape_fear_and_greed_index(self):
         """
@@ -141,7 +187,7 @@ class SentimentScraper:
         social media, and surveys.
 
         Returns:
-            int: The current Fear & Greed Index value (0-100), or 50 (neutral) if scraping fails
+            int | None: The current Fear & Greed Index value (0-100), or None if scraping fails
         """
         try:
             # URL for the Fear & Greed Index
@@ -165,96 +211,139 @@ class SentimentScraper:
                 except ValueError:
                     pass
 
-            return 50  # Default neutral value if element not found
+            return None  # Element not found
         except Exception:
-            return 50  # Default neutral value on any error
+            return None
 
-    def scrape_crypto_news(self, limit=10):
+    def scrape_crypto_news(self, limit=50):
         """
-        Scrape cryptocurrency news from multiple sources.
+        Collect cryptocurrency news from the RSS feeds.
 
-        This method collects news articles from various cryptocurrency news websites,
-        extracts relevant information, analyzes sentiment, and identifies which
-        cryptocurrencies are mentioned in each article.
-
-        The method tries multiple primary sources first, then falls back to additional
-        sources if needed to reach the requested number of articles.
+        The limit is shared evenly so that no single publication dominates the
+        score, and an article carried by two feeds is counted once.
 
         Args:
-            limit (int, optional): Maximum number of news articles to collect. Defaults to 10.
+            limit (int, optional): Maximum number of news articles to collect.
 
         Returns:
             list: A list of dictionaries containing news article data, including title,
                   summary, source, URL, sentiment score, and mentioned cryptocurrencies
         """
         news_items = []
+        seen_urls = set()
+        per_feed = max(1, limit // len(NEWS_FEEDS))
 
-        # Define primary news sources to scrape with their CSS selectors
-        news_sources = [
-            {
-                "name": "CoinDesk",  # Name of the news source
-                "url": "https://www.coindesk.com/",  # URL to scrape
-                "article_selector": "article",  # CSS selector for article elements
-                "title_selector": [
-                    "h6",
-                    "h5",
-                    "h4",
-                ],  # CSS selectors for title elements (tried in order)
-                "summary_selector": "p",  # CSS selector for summary/content elements
-                "base_url": "https://www.coindesk.com",  # Base URL for resolving relative links
-            },
-            {
-                "name": "Cointelegraph",
-                "url": "https://cointelegraph.com/",
-                "article_selector": "article",
-                "title_selector": ["h2", "h1"],
-                "summary_selector": "p.post-card__text",
-                "base_url": "https://cointelegraph.com",
-            },
-            {
-                "name": "CryptoNews",
-                "url": "https://cryptonews.com/",
-                "article_selector": ".cn-tile",
-                "title_selector": ["h4", "h3"],
-                "summary_selector": "p",
-                "base_url": "https://cryptonews.com",
-            },
-        ]
-
-        # Track how many articles we've collected so far
-        total_collected = 0
-
-        # Try each primary news source until we have enough articles
-        for source in news_sources:
-            # Stop if we've already collected enough articles
-            if total_collected >= limit:
-                break
-
+        for name, url in NEWS_FEEDS:
             try:
-                # Scrape this specific news source
-                source_items = self._scrape_news_source(source, limit - total_collected)
+                response = requests.get(url, headers=self.headers, timeout=10)
+                if response.status_code != 200:
+                    logger.warning("%s feed returned HTTP %s", name, response.status_code)
+                    continue
+                if len(response.content) > MAX_FEED_BYTES:
+                    logger.warning("%s feed is too large; skipping it", name)
+                    continue
 
-                if source_items:
-                    # Add the scraped items to our collection
-                    news_items.extend(source_items)
-                    total_collected += len(source_items)
-            except Exception:
-                continue  # Try the next source if this one fails
+                for entry in self._parse_feed(response.content)[:per_feed]:
+                    if entry["url"] in seen_urls:
+                        continue
+                    seen_urls.add(entry["url"])
+                    news_items.append(self._build_source("news", name, **entry))
+            except Exception as exc:
+                logger.warning("Could not read the %s feed: %s", name, exc)
 
-        # If we still don't have enough articles, try additional backup sources
-        if total_collected < limit:
-            additional_items = self._try_additional_news_sources(limit - total_collected)
-            if additional_items:
-                news_items.extend(additional_items)
-                total_collected += len(additional_items)
-
-        # If we couldn't get any data from any source, return empty list
-        if not news_items:
-            return []
-
-        # Add all collected news items to the sentiment data structure
         self.sentiment_data["sources"].extend(news_items)
         return news_items
+
+    def _parse_feed(self, content):
+        """
+        Parse an RSS document into recent articles.
+
+        Args:
+            content (bytes): The raw feed.
+
+        Returns:
+            list[dict]: Entries with title, summary, url and timestamp.
+        """
+        oldest = utc_now() - timedelta(days=MAX_ARTICLE_AGE_DAYS)
+        entries = []
+
+        for item in ElementTree.fromstring(content).iter("item"):
+            title = html.unescape(item.findtext("title") or "").strip()
+            url = (item.findtext("link") or "").strip()
+            if not title or not url.startswith(("http://", "https://")):
+                continue
+
+            published = self._parse_published(item.findtext("pubDate"))
+            if published < oldest:
+                continue
+
+            summary = BeautifulSoup(
+                item.findtext("description") or "", "html.parser"
+            ).get_text(" ", strip=True)
+
+            entries.append(
+                {
+                    "title": title,
+                    "summary": summary,
+                    "url": url,
+                    "timestamp": published.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            )
+
+        return entries
+
+    @staticmethod
+    def _parse_published(value):
+        """Parse an RSS date to naive UTC, using the current time if it is unusable."""
+        now = utc_now()
+        try:
+            published = parsedate_to_datetime(value)
+        except TypeError, ValueError:
+            return now
+
+        if published.tzinfo is not None:
+            published = published.astimezone(UTC).replace(tzinfo=None)
+        return min(published, now)
+
+    def _find_mentions(self, text):
+        """Return the tracked symbols a piece of text actually mentions."""
+        return [
+            symbol
+            for symbol, pattern in self.mention_patterns.items()
+            if pattern.search(text)
+        ]
+
+    def _build_source(self, source_type, source_name, title, summary, url, timestamp):
+        """
+        Score one article or post and record it against the coins it mentions.
+
+        Returns:
+            dict: The source entry.
+        """
+        text_to_analyze = f"{title} {summary}"
+        compound = _get_analyzer().polarity_scores(text_to_analyze)["compound"]
+        normalized_score = self.normalize_sentiment_score(compound)
+        mentioned_cryptos = self._find_mentions(text_to_analyze)
+
+        for crypto in mentioned_cryptos:
+            entry = self.sentiment_data["crypto_specific"].setdefault(
+                crypto, {"sentiment_scores": [], "sources": []}
+            )
+            entry["sentiment_scores"].append(normalized_score)
+            entry["sources"].append(
+                {"type": source_type, "title": title, "sentiment": normalized_score}
+            )
+
+        return {
+            "type": source_type,
+            "source": source_name,
+            "title": title,
+            "text": summary[:200] + "..." if len(summary) > 200 else summary,
+            "url": url,
+            "timestamp": timestamp,
+            "sentiment": normalized_score,
+            "mentioned_cryptos": mentioned_cryptos,
+        }
 
     def normalize_sentiment_score(self, score, min_val=-1, max_val=1):
         """
@@ -275,278 +364,6 @@ class SentimentScraper:
             float: The normalized sentiment score on a 0-100 scale
         """
         return ((score - min_val) / (max_val - min_val)) * 100
-
-    def _scrape_news_source(self, source, limit):
-        """Scrape a specific news source"""
-        news_items = []
-        try:
-            # Get the page content
-            response = requests.get(source["url"], headers=self.headers, timeout=10)
-            if response.status_code != 200:
-                return []
-
-            soup = BeautifulSoup(response.text, "html.parser")
-
-            # Find news articles
-            articles = soup.select(source["article_selector"])
-            if not articles:
-                return []
-
-            # Process each article
-            for article in articles[:limit]:
-                try:
-                    # Extract title
-                    title = None
-                    for selector in source["title_selector"]:
-                        title_element = article.find(selector)
-                        if title_element:
-                            title = title_element.text.strip()
-                            break
-
-                    if not title:
-                        continue
-
-                    # Extract link
-                    link_element = article.find("a")
-                    link = (
-                        link_element["href"]
-                        if link_element and "href" in link_element.attrs
-                        else ""
-                    )
-                    if link and not link.startswith("http"):
-                        link = source["base_url"] + link
-
-                    # Extract summary if available
-                    summary = ""
-                    summary_element = article.select_one(source["summary_selector"])
-                    if summary_element:
-                        summary = summary_element.text.strip()
-
-                    # Analyze sentiment
-                    text_to_analyze = title + " " + summary
-                    sentiment_score = sia.polarity_scores(text_to_analyze)["compound"]
-                    normalized_score = self.normalize_sentiment_score(sentiment_score)
-
-                    # Determine which cryptocurrencies are mentioned
-                    mentioned_cryptos = []
-                    for symbol in self.crypto_symbols:
-                        if (
-                            symbol in text_to_analyze.upper()
-                            or self.crypto_names[symbol].lower()
-                            in text_to_analyze.lower()
-                        ):
-                            mentioned_cryptos.append(symbol)
-
-                    # If no specific crypto is mentioned, it might be about the market in general
-                    if not mentioned_cryptos and any(
-                        keyword in text_to_analyze.lower()
-                        for keyword in [
-                            "crypto",
-                            "bitcoin",
-                            "blockchain",
-                            "cryptocurrency",
-                        ]
-                    ):
-                        mentioned_cryptos = [
-                            "BTC"
-                        ]  # Default to Bitcoin for general market news
-
-                    # Create news item
-                    news_item = {
-                        "type": "news",
-                        "source": source["name"],
-                        "title": title,
-                        "text": summary,
-                        "url": link,
-                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "sentiment": normalized_score,
-                        "mentioned_cryptos": mentioned_cryptos,
-                    }
-
-                    news_items.append(news_item)
-
-                    # Update crypto-specific sentiment
-                    for crypto in mentioned_cryptos:
-                        if crypto not in self.sentiment_data["crypto_specific"]:
-                            self.sentiment_data["crypto_specific"][crypto] = {
-                                "sentiment_scores": [],
-                                "sources": [],
-                            }
-
-                        self.sentiment_data["crypto_specific"][crypto][
-                            "sentiment_scores"
-                        ].append(normalized_score)
-                        self.sentiment_data["crypto_specific"][crypto]["sources"].append(
-                            {
-                                "type": "news",
-                                "title": title,
-                                "sentiment": normalized_score,
-                            }
-                        )
-
-                except Exception:
-                    continue
-
-            return news_items
-
-        except Exception:
-            return []
-
-    def _try_additional_news_sources(self, limit):
-        """Try additional news sources when primary sources fail"""
-        news_items = []
-
-        # Additional crypto news sources to try
-        additional_sources = [
-            {
-                "name": "BeInCrypto",
-                "url": "https://beincrypto.com/",
-                "article_selector": ".jeg_post",
-                "title_selector": ["h3", "h2"],
-                "summary_selector": "p",
-                "base_url": "https://beincrypto.com",
-            },
-            {
-                "name": "Bitcoinist",
-                "url": "https://bitcoinist.com/",
-                "article_selector": "article",
-                "title_selector": ["h2", "h3"],
-                "summary_selector": ".entry-content p",
-                "base_url": "https://bitcoinist.com",
-            },
-        ]
-
-        # Try each additional source
-        for source in additional_sources:
-            if len(news_items) >= limit:
-                break
-
-            try:
-                source_items = self._scrape_news_source(source, limit - len(news_items))
-                if source_items:
-                    news_items.extend(source_items)
-            except Exception:
-                continue
-
-        # Try RSS feeds as another source
-        if len(news_items) < limit:
-            try:
-                rss_items = self._try_scrape_news_rss(limit - len(news_items))
-                if rss_items:
-                    news_items.extend(rss_items)
-            except Exception:
-                pass
-
-        return news_items
-
-    def _try_scrape_news_rss(self, limit):
-        """Try to scrape news from RSS feeds"""
-        news_items = []
-
-        # Common crypto RSS feeds
-        rss_feeds = [
-            "https://cointelegraph.com/rss",
-            "https://coindesk.com/arc/outboundfeeds/rss/",
-            "https://news.bitcoin.com/feed/",
-        ]
-
-        for feed_url in rss_feeds:
-            if len(news_items) >= limit:
-                break
-
-            try:
-                response = requests.get(feed_url, headers=self.headers, timeout=10)
-                if response.status_code != 200:
-                    continue
-
-                # Parse the RSS feed
-                soup = BeautifulSoup(response.text, "xml")
-
-                # Find items
-                items = soup.find_all("item")
-
-                for item in items[: limit - len(news_items)]:
-                    try:
-                        # Extract title
-                        title_elem = item.find("title")
-                        if not title_elem:
-                            continue
-                        title = title_elem.text.strip()
-
-                        # Extract link
-                        link_elem = item.find("link")
-                        link = link_elem.text.strip() if link_elem else "#"
-
-                        # Extract description/summary
-                        desc_elem = item.find("description")
-                        description = desc_elem.text.strip() if desc_elem else ""
-
-                        # Clean up description (remove HTML)
-                        description = BeautifulSoup(description, "html.parser").get_text()
-
-                        # Extract source
-                        source_name = "Crypto News"
-                        if "cointelegraph.com" in feed_url:
-                            source_name = "Cointelegraph"
-                        elif "coindesk.com" in feed_url:
-                            source_name = "CoinDesk"
-                        elif "bitcoin.com" in feed_url:
-                            source_name = "Bitcoin.com"
-
-                        # Analyze sentiment
-                        text_to_analyze = title + " " + description
-                        sentiment_score = sia.polarity_scores(text_to_analyze)["compound"]
-                        normalized_score = self.normalize_sentiment_score(sentiment_score)
-
-                        # Determine which cryptocurrencies are mentioned
-                        mentioned_cryptos = []
-                        for symbol in self.crypto_symbols:
-                            if (
-                                symbol in text_to_analyze.upper()
-                                or self.crypto_names[symbol].lower()
-                                in text_to_analyze.lower()
-                            ):
-                                mentioned_cryptos.append(symbol)
-
-                        # If no specific crypto is mentioned, it might be about the market in general
-                        if not mentioned_cryptos and any(
-                            keyword in text_to_analyze.lower()
-                            for keyword in [
-                                "crypto",
-                                "bitcoin",
-                                "blockchain",
-                                "cryptocurrency",
-                            ]
-                        ):
-                            mentioned_cryptos = [
-                                "BTC"
-                            ]  # Default to Bitcoin for general market news
-
-                        # Create news item
-                        news_item = {
-                            "type": "news",
-                            "source": source_name,
-                            "title": title,
-                            "text": (
-                                description[:200] + "..."
-                                if len(description) > 200
-                                else description
-                            ),
-                            "url": link,
-                            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            "sentiment": normalized_score,
-                            "mentioned_cryptos": mentioned_cryptos,
-                        }
-
-                        news_items.append(news_item)
-
-                    except Exception:
-                        continue
-
-            except Exception:
-                continue
-
-        return news_items
 
     def scrape_reddit_sentiment(self, subreddit="CryptoCurrency", limit=10):
         """
@@ -571,6 +388,9 @@ class SentimentScraper:
 
             # Make the HTTP request
             response = requests.get(url, headers=self.headers, timeout=15)
+            if response.status_code != 200:
+                logger.warning("Reddit returned HTTP %s", response.status_code)
+                return []
 
             # Parse the HTML content
             soup = BeautifulSoup(response.text, "html.parser")
@@ -603,63 +423,16 @@ class SentimentScraper:
                             if content_element:
                                 content = content_element.text.strip()
 
-                    # Analyze sentiment using VADER
-                    text_to_analyze = title + " " + content
-                    sentiment_score = sia.polarity_scores(text_to_analyze)["compound"]
-                    normalized_score = self.normalize_sentiment_score(sentiment_score)
-
-                    # Determine which cryptocurrencies are mentioned in the post
-                    mentioned_cryptos = []
-                    for symbol in self.crypto_symbols:
-                        # Check for both symbol (e.g., "BTC") and full name (e.g., "Bitcoin")
-                        if (
-                            symbol in text_to_analyze.upper()
-                            or self.crypto_names[symbol].lower()
-                            in text_to_analyze.lower()
-                        ):
-                            mentioned_cryptos.append(symbol)
-
-                    # Create data structure for this Reddit post
-                    reddit_item = {
-                        "type": "reddit",  # Source type
-                        "source": f"r/{subreddit}",  # Specific subreddit
-                        "title": title,  # Post title
-                        "text": (
-                            content[:200] + "..." if len(content) > 200 else content
-                        ),  # Truncated content
-                        "url": link,  # Post URL
-                        "timestamp": datetime.now().strftime(
-                            "%Y-%m-%d %H:%M:%S"
-                        ),  # Current timestamp
-                        "sentiment": normalized_score,  # Sentiment score (0-100)
-                        "mentioned_cryptos": mentioned_cryptos,  # List of mentioned cryptocurrencies
-                    }
-
-                    # Add to the list of Reddit items
-                    reddit_items.append(reddit_item)
-
-                    # Update cryptocurrency-specific sentiment data
-                    for crypto in mentioned_cryptos:
-                        # Initialize data structure for this crypto if it doesn't exist
-                        if crypto not in self.sentiment_data["crypto_specific"]:
-                            self.sentiment_data["crypto_specific"][crypto] = {
-                                "sentiment_scores": [],
-                                "sources": [],
-                            }
-
-                        # Add sentiment score for this crypto
-                        self.sentiment_data["crypto_specific"][crypto][
-                            "sentiment_scores"
-                        ].append(normalized_score)
-
-                        # Add source reference for this crypto
-                        self.sentiment_data["crypto_specific"][crypto]["sources"].append(
-                            {
-                                "type": "reddit",
-                                "title": title,
-                                "sentiment": normalized_score,
-                            }
+                    reddit_items.append(
+                        self._build_source(
+                            "reddit",
+                            f"r/{subreddit}",
+                            title=title,
+                            summary=content,
+                            url=link,
+                            timestamp=self._post_time(post),
                         )
+                    )
 
                 except Exception:
                     continue  # Skip this post and continue with the next one
@@ -668,8 +441,19 @@ class SentimentScraper:
             self.sentiment_data["sources"].extend(reddit_items)
             return reddit_items
 
-        except Exception:
+        except Exception as exc:
+            logger.warning("Could not read Reddit: %s", exc)
             return []  # Return empty list on error
+
+    @staticmethod
+    def _post_time(post):
+        """Return a Reddit post's creation time, or now if it is not available."""
+        try:
+            created = datetime.fromtimestamp(int(post["data-timestamp"]) / 1000, UTC)
+            moment = created.replace(tzinfo=None)
+        except KeyError, TypeError, ValueError, OverflowError, OSError:
+            moment = utc_now()
+        return moment.strftime("%Y-%m-%d %H:%M:%S")
 
     def calculate_overall_sentiment(self):
         """
@@ -686,15 +470,14 @@ class SentimentScraper:
         - 30% social media sentiment (Reddit)
         - 20% Fear & Greed Index (market indicator)
 
+        A source that returned nothing is left out and the remaining weights are
+        renormalized, so an outage never counts as a neutral reading.
+
         Returns:
-            float: The overall market sentiment score (0-100), or 50 (neutral) if calculation fails
+            float | None: The overall market sentiment score (0-100), or None
+            when no source returned data
         """
         try:
-            # Collect all sentiment scores for reference (not used in calculation)
-            all_scores = []
-            for source in self.sentiment_data["sources"]:
-                all_scores.append(source["sentiment"])
-
             # Calculate social media sentiment (Reddit only, X.com removed)
             # Extract sentiment scores from Reddit sources
             social_scores = [
@@ -702,9 +485,8 @@ class SentimentScraper:
                 for s in self.sentiment_data["sources"]
                 if s["type"] == "reddit"
             ]
-            # Calculate average, defaulting to neutral (50) if no data
             social_sentiment = (
-                sum(social_scores) / len(social_scores) if social_scores else 50
+                sum(social_scores) / len(social_scores) if social_scores else None
             )
 
             # Calculate news sentiment
@@ -714,18 +496,27 @@ class SentimentScraper:
                 for s in self.sentiment_data["sources"]
                 if s["type"] == "news"
             ]
-            # Calculate average, defaulting to neutral (50) if no data
-            news_sentiment = sum(news_scores) / len(news_scores) if news_scores else 50
+            news_sentiment = sum(news_scores) / len(news_scores) if news_scores else None
 
-            # Get Fear & Greed Index value, defaulting to neutral (50) if not available
-            fear_greed = (
-                self.fear_greed_index if self.fear_greed_index is not None else 50
-            )
+            fear_greed = self.fear_greed_index
 
-            # Calculate overall sentiment as a weighted average of the three components
-            # 50% news, 30% Reddit, 20% fear & greed (adjusted weights since X.com was removed)
-            overall_sentiment = (
-                (0.5 * news_sentiment) + (0.3 * social_sentiment) + (0.2 * fear_greed)
+            # Calculate overall sentiment as a weighted average of the components
+            # that have data: 50% news, 30% Reddit, 20% fear & greed
+            components = [
+                (weight, value)
+                for weight, value in (
+                    (0.5, news_sentiment),
+                    (0.3, social_sentiment),
+                    (0.2, fear_greed),
+                )
+                if value is not None
+            ]
+            if not components:
+                self.sentiment_data["overall"] = {}
+                return None
+
+            overall_sentiment = sum(weight * value for weight, value in components) / sum(
+                weight for weight, _value in components
             )
 
             # Update the sentiment data structure with the calculated values
@@ -734,15 +525,15 @@ class SentimentScraper:
                 "social_sentiment": social_sentiment,  # Reddit sentiment
                 "news_sentiment": news_sentiment,  # News sentiment
                 "fear_greed_index": fear_greed,  # Fear & Greed Index
-                "timestamp": datetime.now().strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                ),  # Current timestamp
+                "timestamp": utc_now().strftime("%Y-%m-%d %H:%M:%S"),  # Current timestamp
             }
 
             return overall_sentiment
 
         except Exception:
-            return 50  # Default to neutral value on error
+            logger.exception("Failed to calculate overall sentiment")
+            self.sentiment_data["overall"] = {}
+            return None
 
     def calculate_crypto_rankings(self):
         """
@@ -837,7 +628,7 @@ class SentimentScraper:
         if max_age_days is None:
             max_age_days = config.SENTIMENT_RETENTION_DAYS
 
-        cutoff_time = datetime.now() - timedelta(days=max_age_days)
+        cutoff_time = utc_now() - timedelta(days=max_age_days)
 
         # Remove old snapshots and return how many were deleted
         return db.delete_sentiment_before(cutoff_time)
@@ -919,6 +710,11 @@ class SentimentScraper:
         Returns:
             bool: True if the snapshot was saved successfully, False otherwise.
         """
+        # With no real reading, keep the last good snapshot as the latest one.
+        if not self.sentiment_data.get("overall"):
+            logger.warning("No sentiment source returned data; nothing stored")
+            return False
+
         try:
             # Filter out decrypt.co sources before saving
             self.filter_decrypt_sources()
@@ -935,6 +731,7 @@ class SentimentScraper:
             return True
 
         except Exception:
+            logger.exception("Failed to save the sentiment snapshot")
             return False
 
     def run_scraper(self):
@@ -965,7 +762,7 @@ class SentimentScraper:
         try:
             # Step 2: Scrape news from cryptocurrency news websites
             # Increased limit to get more news from various sources for better coverage
-            self.scrape_crypto_news(limit=30)
+            self.scrape_crypto_news(limit=50)
         except Exception:
             pass
 
@@ -992,7 +789,7 @@ class SentimentScraper:
         try:
             # Step 6: Save all collected and processed data to JSON files
             # This saves both a timestamped file and updates the latest data file
-            self.save_sentiment_data()
+            self.saved = self.save_sentiment_data()
         except Exception:
             pass
 

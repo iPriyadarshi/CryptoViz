@@ -40,11 +40,10 @@ def run_backfill():
     """
     Backfill historical prices from CoinGecko.
 
-    Accepts an optional number of days as the single argument; without it the
-    configured retention window is used.
+    Accepts an optional number of days as the single argument.
 
-        cryptoviz-backfill          # the full retention window
-        cryptoviz-backfill 90       # just the last 90 days
+        cryptoviz-backfill          # the last 31 days
+        cryptoviz-backfill 90       # the last 90 days
     """
     configure_logging()
     from .scrapers.historical import main
@@ -100,7 +99,9 @@ def scrape_once():
         ("top gainers", updater.collect_top_gainers),
     ):
         try:
-            task()
+            if not task():
+                logger.error("One-off %s scrape stored nothing", name)
+                exit_code = 1
         except Exception:
             logger.exception("One-off %s scrape failed", name)
             exit_code = 1

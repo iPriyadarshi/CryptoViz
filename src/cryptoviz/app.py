@@ -38,7 +38,7 @@ def create_app():
         template_folder=str(config.PACKAGE_ROOT / "templates"),
     )
 
-    app.config["JSON_SORT_KEYS"] = False
+    app.json.sort_keys = False
 
     # The frontend is same-origin; this only opens the API to other consumers.
     CORS(app, resources={r"/api/*": {"origins": config.CORS_ORIGINS}})

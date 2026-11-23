@@ -37,9 +37,9 @@ log "Installing system packages"
 if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
-    apt-get install -y -qq nginx curl ca-certificates rsync
+    apt-get install -y -qq nginx curl ca-certificates rsync sqlite3
 elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y -q nginx curl ca-certificates rsync
+    dnf install -y -q nginx curl ca-certificates rsync sqlite
 else
     echo "Unsupported distribution: need apt-get or dnf." >&2
     exit 1
@@ -76,9 +76,12 @@ mkdir -p "$APP_DIR" "$DATA_DIR" "$NLTK_DIR"
 # ---------------------------------------------------------------------------
 if [[ "$REPO_DIR" != "$APP_DIR" ]]; then
     log "Copying application code to $APP_DIR"
+    # .git is copied so update.sh can pull. .env and the environments are
+    # excluded, which also protects the deployed copies from --delete.
     rsync -a --delete \
-          --exclude '.git' \
+          --exclude '.env' \
           --exclude '.venv' \
+          --exclude '.python' \
           --exclude '__pycache__' \
           --exclude '*.db' \
           "$REPO_DIR/" "$APP_DIR/"
@@ -103,11 +106,7 @@ chown "$APP_USER:$APP_USER" "$APP_DIR/.env"
 # Python environment
 # ---------------------------------------------------------------------------
 log "Installing the Python environment with uv"
-# --frozen installs exactly what uv.lock pins; the deployed environment is then
-# identical to the one the lockfile was tested against.
-cd "$APP_DIR"
-sudo -u "$APP_USER" env "PATH=/usr/local/bin:$PATH" HOME="/home/$APP_USER" \
-     "$UV_BIN" sync --frozen --no-dev
+bash "$APP_DIR/deploy/sync-env.sh"
 
 # ---------------------------------------------------------------------------
 # NLTK data
@@ -115,7 +114,9 @@ sudo -u "$APP_USER" env "PATH=/usr/local/bin:$PATH" HOME="/home/$APP_USER" \
 log "Installing the VADER sentiment lexicon"
 # Downloaded once, system-wide, so neither service reaches for the network at
 # startup. NLTK_DATA in the unit files points here.
-"$APP_DIR/.venv/bin/python" -m nltk.downloader -d "$NLTK_DIR" vader_lexicon
+# Runs as root, so it must not leave root-owned bytecode in the service's .venv.
+PYTHONDONTWRITEBYTECODE=1 "$APP_DIR/.venv/bin/python" -m nltk.downloader \
+    -d "$NLTK_DIR" vader_lexicon
 chmod -R a+rX "$NLTK_DIR"
 
 # ---------------------------------------------------------------------------
@@ -157,8 +158,9 @@ nginx -t
 # Start everything
 # ---------------------------------------------------------------------------
 log "Starting services"
-systemctl enable --now cryptoviz-web.service
-systemctl enable --now cryptoviz-worker.service
+# restart rather than --now, so a re-run picks up the new code.
+systemctl enable cryptoviz-web.service cryptoviz-worker.service
+systemctl restart cryptoviz-web.service cryptoviz-worker.service
 systemctl restart nginx
 systemctl enable nginx
 

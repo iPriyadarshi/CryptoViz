@@ -12,12 +12,25 @@ or the day - which is how long windows are downsampled without a date function.
 
 import json
 import logging
-from datetime import datetime
+import math
+from datetime import datetime, timedelta
 
 import pandas as pd
-from sqlalchemy import delete, func, insert, literal, select
+from sqlalchemy import (
+    Float,
+    String,
+    and_,
+    cast,
+    delete,
+    func,
+    insert,
+    literal,
+    or_,
+    select,
+)
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
+from .. import config
 from .engine import get_engine
 from .models import (
     DAY_PREFIX_LENGTH,
@@ -29,6 +42,7 @@ from .models import (
     sentiment_source_mentions,
     sentiment_sources,
     top_gainers_snapshots,
+    utc_now,
 )
 
 logger = logging.getLogger(__name__)
@@ -41,7 +55,14 @@ PRICE_COLUMNS = [
     "volume_24h",
     "percent_change_24h",
     "timestamp",
+    "close",
+    "low",
+    "high",
 ]
+
+# Length of a TIMESTAMP_FORMAT string, plus the separator used to find a
+# bucket's last price (see _aggregate_select).
+_CLOSE_VALUE_OFFSET = 21
 
 # Granularities accepted by get_prices_df(bucket=...).
 BUCKET_PREFIXES = {
@@ -68,34 +89,76 @@ def _normalize_timestamp(value):
     try:
         return pd.to_datetime(value).strftime(TIMESTAMP_FORMAT)
     except Exception:
-        return datetime.now().strftime(TIMESTAMP_FORMAT)
+        return utc_now().strftime(TIMESTAMP_FORMAT)
+
+
+def _finite(value):
+    """Return value as a float, or None when it is missing, NaN or infinite."""
+    try:
+        number = float(value)
+    except TypeError, ValueError:
+        return None
+    return number if math.isfinite(number) else None
 
 
 def save_prices(data):
     """
     Persist a batch of cryptocurrency price records.
 
+    A row without a usable positive price is skipped, since one bad value would
+    corrupt every return calculated across it. Saving a symbol and timestamp
+    that already exist updates that row.
+
     Args:
         data (list[dict]): rows containing the PRICE_COLUMNS keys.
+
+    Returns:
+        int: Number of rows written.
     """
     if not data:
-        return
+        return 0
 
-    rows = [
-        {
-            "symbol": entry.get("symbol"),
-            "name": entry.get("name"),
-            "price": entry.get("price"),
-            "market_cap": entry.get("market_cap"),
-            "volume_24h": entry.get("volume_24h"),
-            "percent_change_24h": entry.get("percent_change_24h"),
-            "timestamp": _normalize_timestamp(entry.get("timestamp")),
-        }
-        for entry in data
-    ]
+    rows = []
+    for entry in data:
+        price = _finite(entry.get("price"))
+        if price is None or price <= 0:
+            logger.warning("Skipping %s: invalid price", entry.get("symbol"))
+            continue
+
+        rows.append(
+            {
+                "symbol": entry.get("symbol"),
+                "name": entry.get("name"),
+                "price": price,
+                "market_cap": _finite(entry.get("market_cap")),
+                "volume_24h": _finite(entry.get("volume_24h")),
+                "percent_change_24h": _finite(entry.get("percent_change_24h")),
+                "timestamp": _normalize_timestamp(entry.get("timestamp")),
+            }
+        )
+
+    if not rows:
+        return 0
+
+    stmt = sqlite_insert(crypto_prices)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["symbol", "timestamp"],
+        set_={
+            column: stmt.excluded[column]
+            for column in (
+                "name",
+                "price",
+                "market_cap",
+                "volume_24h",
+                "percent_change_24h",
+            )
+        },
+    )
 
     with get_engine().begin() as conn:
-        conn.execute(insert(crypto_prices), rows)
+        conn.execute(stmt, rows)
+
+    return len(rows)
 
 
 def _bucket_pad(bucket):
@@ -103,9 +166,15 @@ def _bucket_pad(bucket):
     return ":00:00" if bucket == "hour" else " 00:00:00"
 
 
+def _bucket_start(moment, bucket):
+    """Return the start of the bucket containing a time, as stored text."""
+    prefix = moment.strftime(TIMESTAMP_FORMAT)[: BUCKET_PREFIXES[bucket]]
+    return prefix + _bucket_pad(bucket)
+
+
 def _aggregate_select(bucket, symbol=None, since=None):
     """
-    Build the GROUP BY that averages raw price rows into buckets.
+    Build the GROUP BY that summarizes raw price rows into buckets.
 
     Used both to populate price_buckets and as the read fallback when that table
     has not been built yet.
@@ -115,9 +184,16 @@ def _aggregate_select(bucket, symbol=None, since=None):
     ix_crypto_prices_{hour,day}_symbol, so the filter is a range search instead
     of a full index scan; and it includes the whole bucket containing `since`
     rather than averaging a partial one.
+
+    The close is the price of the newest row. Taking MAX over "timestamp|price"
+    finds it in the same pass as the other aggregates, because timestamps sort
+    chronologically and are unique per symbol.
     """
     prefix_length = BUCKET_PREFIXES[bucket]
     bucket_key = func.substr(crypto_prices.c.timestamp, 1, prefix_length)
+    stamped_price = crypto_prices.c.timestamp.concat("|").concat(
+        cast(crypto_prices.c.price, String)
+    )
 
     stmt = select(
         crypto_prices.c.symbol,
@@ -127,6 +203,11 @@ def _aggregate_select(bucket, symbol=None, since=None):
         func.avg(crypto_prices.c.volume_24h).label("volume_24h"),
         func.avg(crypto_prices.c.percent_change_24h).label("percent_change_24h"),
         (bucket_key + _bucket_pad(bucket)).label("timestamp"),
+        cast(func.substr(func.max(stamped_price), _CLOSE_VALUE_OFFSET), Float).label(
+            "close"
+        ),
+        func.min(crypto_prices.c.price).label("low"),
+        func.max(crypto_prices.c.price).label("high"),
     ).group_by(crypto_prices.c.symbol, bucket_key)
 
     if symbol is not None:
@@ -206,6 +287,9 @@ def refresh_price_buckets(since=None):
                         "volume_24h",
                         "percent_change_24h",
                         "timestamp",
+                        "close",
+                        "low",
+                        "high",
                         "granularity",
                     ],
                     source,
@@ -226,12 +310,23 @@ def count_price_buckets(granularity=None):
 
 
 def delete_price_buckets_before(cutoff):
-    """Remove rollup buckets older than the cutoff. Returns rows deleted."""
-    cutoff_str = cutoff.strftime(TIMESTAMP_FORMAT)
-    with get_engine().begin() as conn:
-        result = conn.execute(
-            delete(price_buckets).where(price_buckets.c.timestamp < cutoff_str)
+    """
+    Remove rollup buckets that end before the cutoff. Returns rows deleted.
+
+    The bucket containing the cutoff stays, because it still summarizes raw rows
+    that are inside the retention window.
+    """
+    expired = or_(
+        *(
+            and_(
+                price_buckets.c.granularity == granularity,
+                price_buckets.c.timestamp < _bucket_start(cutoff, granularity),
+            )
+            for granularity in BUCKET_PREFIXES
         )
+    )
+    with get_engine().begin() as conn:
+        result = conn.execute(delete(price_buckets).where(expired))
         return result.rowcount or 0
 
 
@@ -252,8 +347,9 @@ def get_prices_df(symbol=None, since=None, bucket=None):
 
     Returns:
         pandas.DataFrame: columns symbol, name, price, market_cap, volume_24h,
-        percent_change_24h, timestamp (datetime64). Empty (with the right
-        columns) when there is no matching data.
+        percent_change_24h, timestamp (datetime64), close, low, high. For raw
+        rows the last three equal the price. Empty (with the right columns)
+        when there is no matching data.
     """
     if bucket and bucket not in BUCKET_PREFIXES:
         raise ValueError(f"Unsupported bucket {bucket!r}; use 'hour' or 'day'.")
@@ -267,14 +363,16 @@ def get_prices_df(symbol=None, since=None, bucket=None):
             price_buckets.c.volume_24h,
             price_buckets.c.percent_change_24h,
             price_buckets.c.timestamp,
+            price_buckets.c.close,
+            price_buckets.c.low,
+            price_buckets.c.high,
         ).where(price_buckets.c.granularity == bucket)
 
         if symbol is not None:
             stmt = stmt.where(price_buckets.c.symbol == symbol)
         if since is not None:
-            stmt = stmt.where(
-                price_buckets.c.timestamp >= since.strftime(TIMESTAMP_FORMAT)
-            )
+            # Include the bucket containing `since`, as the raw fallback does.
+            stmt = stmt.where(price_buckets.c.timestamp >= _bucket_start(since, bucket))
     elif bucket:
         logger.debug("No %s buckets available yet; aggregating from raw rows", bucket)
         stmt = _aggregate_select(bucket, symbol=symbol, since=since)
@@ -297,6 +395,9 @@ def get_prices_df(symbol=None, since=None, bucket=None):
 
     df = pd.read_sql(stmt, get_engine())
 
+    # Rows stored before prices were validated must not reach return maths.
+    df = df[df["price"].notna() & (df["price"] > 0)]
+
     if df.empty:
         return pd.DataFrame(columns=PRICE_COLUMNS)
 
@@ -305,6 +406,11 @@ def get_prices_df(symbol=None, since=None, bucket=None):
     df["timestamp"] = pd.to_datetime(
         df["timestamp"], format=TIMESTAMP_FORMAT, errors="coerce"
     )
+
+    # Raw rows have no range, and a bucket written before these columns existed
+    # has none until the worker's startup rebuild.
+    for column in ("close", "low", "high"):
+        df[column] = df[column].fillna(df["price"]) if column in df else df["price"]
     return df
 
 
@@ -321,10 +427,15 @@ def count_prices(symbol=None, since=None):
 
 def get_latest_prices():
     """
-    Return the price rows belonging to the most recent timestamp.
+    Return the newest row for each currently tracked cryptocurrency.
+
+    A coin counts as current if it was seen within two scrape intervals of the
+    newest row, so one partial batch cannot hide the others while a coin that
+    left the top 10 drops out.
 
     Returns:
-        list[dict]: one row per cryptocurrency, or [] when there is no data.
+        list[dict]: one row per cryptocurrency, largest market cap first, or []
+        when there is no data.
     """
     engine = get_engine()
     latest_stmt = (
@@ -338,15 +449,27 @@ def get_latest_prices():
         if latest is None:
             return []
 
-        stmt = select(
-            crypto_prices.c.symbol,
-            crypto_prices.c.name,
-            crypto_prices.c.price,
-            crypto_prices.c.market_cap,
-            crypto_prices.c.volume_24h,
-            crypto_prices.c.percent_change_24h,
-            crypto_prices.c.timestamp,
-        ).where(crypto_prices.c.timestamp == latest)
+        window = timedelta(seconds=2 * config.PRICE_UPDATE_INTERVAL)
+        cutoff = datetime.strptime(latest, TIMESTAMP_FORMAT) - window
+
+        # With a single MAX(), SQLite takes the other columns from that row.
+        stmt = (
+            select(
+                crypto_prices.c.symbol,
+                crypto_prices.c.name,
+                crypto_prices.c.price,
+                crypto_prices.c.market_cap,
+                crypto_prices.c.volume_24h,
+                crypto_prices.c.percent_change_24h,
+                func.max(crypto_prices.c.timestamp).label("timestamp"),
+            )
+            # The time index reaches the few recent rows directly. Left to
+            # itself SQLite walks the whole symbol index to satisfy the GROUP BY.
+            .with_hint(crypto_prices, "INDEXED BY ix_crypto_prices_ts", "sqlite")
+            .where(crypto_prices.c.timestamp >= cutoff.strftime(TIMESTAMP_FORMAT))
+            .group_by(crypto_prices.c.symbol)
+            .order_by(crypto_prices.c.market_cap.desc().nulls_last())
+        )
         rows = conn.execute(stmt).mappings().all()
 
     return [dict(row) for row in rows]
@@ -428,7 +551,7 @@ def save_sentiment_snapshot(sentiment_data):
     upserted into sentiment_sources, so a source seen in many scrapes occupies
     one row whose last_seen advances.
     """
-    now = datetime.now().strftime(TIMESTAMP_FORMAT)
+    now = utc_now().strftime(TIMESTAMP_FORMAT)
     aggregates, sources = _split_snapshot(sentiment_data)
 
     with get_engine().begin() as conn:
@@ -489,7 +612,8 @@ def get_latest_sentiment(source_limit=50):
     Return the most recent sentiment reading, with its sources reattached.
 
     Args:
-        source_limit (int): how many recent sources to include.
+        source_limit (int): how many recent sources to include; 0 skips them
+            for callers that only need the aggregates.
 
     Returns:
         dict | None: the same shape the scraper produces, or None when no
@@ -506,7 +630,8 @@ def get_latest_sentiment(source_limit=50):
         return None
 
     data = json.loads(row[0])
-    data["sources"] = query_sentiment_sources(limit=source_limit)
+    if source_limit:
+        data["sources"] = query_sentiment_sources(limit=source_limit)
     return data
 
 
@@ -524,7 +649,40 @@ def get_latest_sentiment_time():
     return datetime.strptime(row[0], TIMESTAMP_FORMAT)
 
 
-def get_sentiment_snapshots_since(cutoff):
+def get_sentiment_averages(cutoff, keys):
+    """
+    Average overall sentiment components across a window, in SQL.
+
+    A component that a snapshot did not measure is null and does not count
+    toward its average.
+
+    Args:
+        cutoff (datetime): only snapshots created at or after this time.
+        keys (iterable[str]): names of the components inside "overall".
+
+    Returns:
+        dict | None: the averages plus 'data_points' and 'timestamp', or None
+        when the window holds no reading.
+    """
+    created_at = sentiment_snapshots.c.created_at
+    data = sentiment_snapshots.c.data
+
+    stmt = select(
+        *(
+            func.avg(func.json_extract(data, f"$.overall.{key}")).label(key)
+            for key in keys
+        ),
+        func.count(func.json_extract(data, "$.overall.sentiment")).label("data_points"),
+        func.max(created_at).label("timestamp"),
+    ).where(created_at >= cutoff.strftime(TIMESTAMP_FORMAT))
+
+    with get_engine().connect() as conn:
+        row = conn.execute(stmt).mappings().first()
+
+    return dict(row) if row and row["data_points"] else None
+
+
+def get_sentiment_snapshots_since(cutoff, bucket=None):
     """
     Return sentiment snapshots created on/after cutoff, oldest first.
 
@@ -532,15 +690,39 @@ def get_sentiment_snapshots_since(cutoff):
     trends, and reattaching sources per snapshot is what the normalization was
     meant to avoid.
 
+    Args:
+        cutoff (datetime): only snapshots created at or after this time.
+        bucket (str, optional): 'hour' or 'day' keeps only the newest snapshot
+            of each bucket, so a long window parses hundreds of rows instead
+            of ~105,000.
+
     Returns:
         list[tuple[datetime, dict]]: (created_at, aggregate data)
     """
     cutoff_str = cutoff.strftime(TIMESTAMP_FORMAT)
-    stmt = (
-        select(sentiment_snapshots.c.created_at, sentiment_snapshots.c.data)
-        .where(sentiment_snapshots.c.created_at >= cutoff_str)
-        .order_by(sentiment_snapshots.c.created_at.asc())
-    )
+    created_at = sentiment_snapshots.c.created_at
+
+    if bucket:
+        # Find each bucket's newest row from the index alone, then read only
+        # those rows' JSON. With a single MAX(), SQLite takes `id` from that row.
+        newest = (
+            select(sentiment_snapshots.c.id, func.max(created_at))
+            .where(created_at >= cutoff_str)
+            .group_by(func.substr(created_at, 1, BUCKET_PREFIXES[bucket]))
+            .subquery()
+        )
+        stmt = (
+            select(created_at, sentiment_snapshots.c.data)
+            .where(sentiment_snapshots.c.id.in_(select(newest.c.id)))
+            .order_by(created_at.asc())
+        )
+    else:
+        stmt = (
+            select(created_at, sentiment_snapshots.c.data)
+            .where(created_at >= cutoff_str)
+            .order_by(created_at.asc())
+        )
+
     with get_engine().connect() as conn:
         rows = conn.execute(stmt).all()
 
@@ -706,7 +888,7 @@ def save_top_gainers(data):
         conn.execute(
             insert(top_gainers_snapshots),
             {
-                "created_at": datetime.now().strftime(TIMESTAMP_FORMAT),
+                "created_at": utc_now().strftime(TIMESTAMP_FORMAT),
                 "data": json.dumps(data),
             },
         )

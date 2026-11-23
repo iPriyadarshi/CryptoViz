@@ -6,28 +6,38 @@ const API_BASE_URL = ''; // same-origin
 let topGainersChart;
 let chartResizeObserver = null;
 let topGainersData = [];
+const nextGainersSignal = createRequestTracker();
 
 // Initialize the page
-document.addEventListener('DOMContentLoaded', function() {
+document.addEventListener('DOMContentLoaded', initializePage);
 
-    // Make sure Chart.js is loaded
-    if (typeof Chart === 'undefined') {
-
-        // Try to load Chart.js dynamically if it's not already loaded
-        const chartScript = document.createElement('script');
-        chartScript.src = 'https://cdn.jsdelivr.net/npm/chart.js';
-        chartScript.onload = initializePage;
-        chartScript.onerror = () => {
-
-            // Still try to initialize the page without charts
-            initializePage();
-        };
-        document.head.appendChild(chartScript);
-    } else {
-        // Chart.js is already loaded, proceed with initialization
-        initializePage();
-    }
+// Keep the chart readable when the theme changes
+document.addEventListener('themeChanged', function(e) {
+    updateGainersChartTheme(e.detail.theme);
 });
+
+// Axis colors for a theme
+function gainersChartColors(theme) {
+    const isDark = theme === 'dark';
+    return {
+        text: isDark ? '#e9ecef' : '#212529',
+        grid: isDark ? 'rgba(255, 255, 255, 0.1)' : 'rgba(0, 0, 0, 0.1)'
+    };
+}
+
+// Apply a theme to the existing chart
+function updateGainersChartTheme(theme) {
+    if (!topGainersChart) return;
+
+    const colors = gainersChartColors(theme);
+    ['x', 'y'].forEach(axis => {
+        const scale = topGainersChart.options.scales[axis];
+        scale.ticks.color = colors.text;
+        scale.title.color = colors.text;
+        scale.grid.color = colors.grid;
+    });
+    topGainersChart.update();
+}
 
 // Function to initialize the page components
 function initializePage() {
@@ -276,30 +286,16 @@ function initRefreshButton() {
             this.disabled = true;
             this.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> Refreshing...';
 
-            // Trigger data update
-            fetch(`${API_BASE_URL}/api/top-gainers/update?force=true`)
-                .then(response => response.json())
-                .then(data => {
+            // Reload the latest snapshot; the worker keeps it up to date
+            loadTopGainersData();
 
-                    if (data.status === 'success') {
-
-                        // Reload the data
-                        loadTopGainersData();
-                    }
-                })
-                .catch(error => {
-
-                    showError(document.querySelector('.top-gainers-overview-panel .card-body'), 'Failed to refresh data');
-                })
-                .finally(() => {
-                    // Reset button state
-                    setTimeout(() => {
-                        refreshButton.disabled = false;
-                        refreshButton.innerHTML = '<span id="refreshIcon"></span> Refresh Data';
-                        // Re-add the refresh icon
-                        document.getElementById('refreshIcon').innerHTML = refreshIcon('ui-icon');
-                    }, 1000);
-                });
+            // Reset button state
+            setTimeout(() => {
+                refreshButton.disabled = false;
+                refreshButton.innerHTML = '<span id="refreshIcon"></span> Refresh Data';
+                // Re-add the refresh icon
+                document.getElementById('refreshIcon').innerHTML = refreshIcon('ui-icon');
+            }, 1000);
         });
     }
 }
@@ -315,6 +311,10 @@ function loadTopGainersData() {
     const overviewPanel = document.querySelector('.top-gainers-overview-panel .card-body');
     const chartContainer = document.querySelector('.chart-container');
     const tableBody = document.getElementById('gainersTableBody');
+    const signal = nextGainersSignal();
+
+    // Clear any error left by a previous load
+    if (overviewPanel) overviewPanel.querySelector('.error-message')?.remove();
 
     // Show loading spinners
     if (overviewPanel) showLoading(overviewPanel);
@@ -335,8 +335,12 @@ function loadTopGainersData() {
     }
 
     // Fetch top gainers data
-    fetch(`${API_BASE_URL}/api/top-gainers`)
+    fetch(`${API_BASE_URL}/api/top-gainers`, { signal })
         .then(response => {
+            // Nothing has been collected yet: an empty state, not a failure
+            if (response.status === 404) {
+                return { data: [], last_updated: null };
+            }
             if (!response.ok) {
                 throw new Error(`Failed to fetch top gainers data: ${response.status} ${response.statusText}`);
             }
@@ -363,8 +367,15 @@ function loadTopGainersData() {
             if (tableBody) {
                 hideLoading(tableBody);
             }
+
+            // Keep any active search applied to the new rows
+            const searchInput = document.getElementById('searchGainers');
+            if (searchInput && searchInput.value.trim()) {
+                filterGainersTable(searchInput.value.toLowerCase().trim());
+            }
         })
         .catch(error => {
+            if (isAbortError(error)) return;
 
             // Hide loading spinners
             if (overviewPanel) {
@@ -386,7 +397,7 @@ function loadTopGainersData() {
                     <tr>
                         <td colspan="6" class="text-center">
                             <div class="alert alert-danger" role="alert">
-                                <p>Failed to load top gainers data: ${error.message}</p>
+                                <p>Failed to load top gainers data</p>
                                 <button class="btn btn-sm btn-outline-danger mt-2" onclick="loadTopGainersData()">
                                     <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-arrow-clockwise" viewBox="0 0 16 16">
                                         <path fill-rule="evenodd" d="M8 3a5 5 0 1 0 4.546 2.914.5.5 0 0 1 .908-.417A6 6 0 1 1 8 2v1z"/>
@@ -407,7 +418,7 @@ function loadTopGainersData() {
                         <tr>
                             <td colspan="6" class="text-center">
                                 <div class="alert alert-danger" role="alert">
-                                    <p>Failed to load top gainers data: ${error.message}</p>
+                                    <p>Failed to load top gainers data</p>
                                     <button class="btn btn-sm btn-outline-danger mt-2" onclick="loadTopGainersData()">
                                         <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-arrow-clockwise" viewBox="0 0 16 16">
                                             <path fill-rule="evenodd" d="M8 3a5 5 0 1 0 4.546 2.914.5.5 0 0 1 .908-.417A6 6 0 1 1 8 2v1z"/>
@@ -453,10 +464,9 @@ function updateTopGainersOverview(data, lastUpdated) {
 // Update top gainers chart
 function updateTopGainersChart(data) {
 
-    // Make sure Chart.js is loaded
+    // The chart library comes from a CDN and may have failed to load
     if (typeof Chart === 'undefined') {
-
-        setTimeout(() => updateTopGainersChart(data), 500); // Try again in 500ms
+        showChartNotice(document.getElementById('topGainersChart'), 'The chart could not be displayed');
         return;
     }
 
@@ -509,8 +519,8 @@ function updateTopGainersChart(data) {
             return `rgba(75, 192, 75, ${0.5 + intensity * 0.5})`; // Adjust opacity based on value
         });
 
-        // Create or update chart
-        if (topGainersChart) {
+        // Update the chart in place while its canvas is still on the page
+        if (topGainersChart && topGainersChart.canvas && topGainersChart.canvas.isConnected) {
 
             try {
                 topGainersChart.data.labels = labels;
@@ -526,6 +536,11 @@ function updateTopGainersChart(data) {
         } else {
 
             try {
+                if (topGainersChart) {
+                    topGainersChart.destroy();
+                    topGainersChart = null;
+                }
+
                 // Make sure the canvas is clean
                 const chartContainer = chartElement.parentElement;
                 if (chartContainer) {
@@ -548,6 +563,10 @@ function updateTopGainersChart(data) {
 
                         return;
                     }
+
+                    const axisColors = gainersChartColors(
+                        document.documentElement.getAttribute('data-theme')
+                    );
 
                     // Create new chart
                     topGainersChart = new Chart(ctx, {
@@ -588,9 +607,14 @@ function updateTopGainersChart(data) {
                                     beginAtZero: true,
                                     title: {
                                         display: true,
-                                        text: 'Price Change (%)'
+                                        text: 'Price Change (%)',
+                                        color: axisColors.text
+                                    },
+                                    grid: {
+                                        color: axisColors.grid
                                     },
                                     ticks: {
+                                        color: axisColors.text,
                                         callback: function(value) {
                                             return value + '%';
                                         }
@@ -599,7 +623,14 @@ function updateTopGainersChart(data) {
                                 x: {
                                     title: {
                                         display: true,
-                                        text: 'Cryptocurrency'
+                                        text: 'Cryptocurrency',
+                                        color: axisColors.text
+                                    },
+                                    grid: {
+                                        color: axisColors.grid
+                                    },
+                                    ticks: {
+                                        color: axisColors.text
                                     }
                                 }
                             }
@@ -679,8 +710,8 @@ function updateTopGainersTable(data) {
                     <td>
                         <div class="crypto-name">
                             <div class="crypto-name-content">
-                                <span>${name}</span>
-                                <small>${symbol}</small>
+                                <span>${escapeHtml(name)}</span>
+                                <small>${escapeHtml(symbol)}</small>
                             </div>
                         </div>
                     </td>
@@ -707,7 +738,7 @@ function updateTopGainersTable(data) {
             <tr>
                 <td colspan="6" class="text-center">
                     <div class="alert alert-danger" role="alert">
-                        <p>Error updating table: ${error.message}</p>
+                        <p>Error updating table: ${escapeHtml(error.message)}</p>
                         <button class="btn btn-sm btn-outline-danger mt-2" onclick="loadTopGainersData()">
                             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-arrow-clockwise" viewBox="0 0 16 16">
                                 <path fill-rule="evenodd" d="M8 3a5 5 0 1 0 4.546 2.914.5.5 0 0 1 .908-.417A6 6 0 1 1 8 2v1z"/>
@@ -797,7 +828,7 @@ function formatCurrency(value) {
 function formatTimestamp(timestamp) {
     if (!timestamp) return 'N/A';
 
-    const date = new Date(timestamp);
+    const date = parseServerTime(timestamp);
     return date.toLocaleString();
 }
 
@@ -867,8 +898,9 @@ function showLoading(container) {
         container.innerHTML = '';
         container.appendChild(loadingSpinner);
 
-        // If we had a canvas, add it back
+        // If we had a canvas, add it back (an earlier error may have hidden it)
         if (canvas) {
+            canvas.style.display = '';
             container.appendChild(canvas);
         } else {
             // Create a new canvas
@@ -997,6 +1029,8 @@ function showError(container, message) {
         errorMessage.style.backgroundColor = 'rgba(220, 53, 69, 0.1)';
         errorMessage.style.zIndex = '10';
         errorMessage.style.padding = '1rem';
+        // The panel's Refresh button must stay clickable so the user can retry
+        errorMessage.style.pointerEvents = 'none';
 
         errorMessage.innerHTML = `
             <svg class="text-danger mb-2" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="2em" height="2em">

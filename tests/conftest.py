@@ -36,6 +36,7 @@ def clean_db():
     """Empty every table so a test starts from a known state."""
     far_future = datetime.now() + timedelta(days=3650)
     repo.delete_prices_before(far_future)
+    repo.delete_price_buckets_before(far_future)
     repo.delete_sentiment_before(far_future)
     repo.delete_top_gainers_before(far_future)
     return repo

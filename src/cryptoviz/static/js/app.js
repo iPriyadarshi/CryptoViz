@@ -13,6 +13,7 @@
 let priceChart;                // Chart.js instance for price chart
 let currentSelectedCrypto = null; // Currently selected cryptocurrency
 let currentTimeframe = '24h';  // Default timeframe for historical data (24h, 7d, 1m)
+const nextHistorySignal = createRequestTracker();
 
 /**
  * Initialize the application when the DOM is fully loaded
@@ -82,18 +83,7 @@ function updateChartTheme(theme) {
  */
 function initEventListeners() {
     // Search functionality with debounce to improve performance
-    document.getElementById('searchCrypto').addEventListener('input', debounce(function() {
-        // Get the search term and convert to lowercase for case-insensitive matching
-        const searchTerm = this.value.toLowerCase().trim();
-        const items = document.querySelectorAll('.crypto-item');
-
-        // Filter cryptocurrency items based on search term
-        items.forEach(item => {
-            const cryptoName = item.textContent.toLowerCase();
-            // Show or hide based on whether the name contains the search term
-            item.style.display = cryptoName.includes(searchTerm) ? 'flex' : 'none';
-        });
-    }, 300)); // 300ms debounce delay
+    document.getElementById('searchCrypto').addEventListener('input', debounce(applyCryptoSearch, 300)); // 300ms debounce delay
 
     // Timeframe selector buttons (24h, 7d, 1m)
     document.querySelectorAll('.btn-timeframe').forEach(btn => {
@@ -110,6 +100,22 @@ function initEventListeners() {
                 fetchHistoricalData(currentSelectedCrypto.symbol, currentTimeframe);
             }
         });
+    });
+}
+
+/**
+ * Show only the cryptocurrency items matching the search box
+ */
+function applyCryptoSearch() {
+    // Get the search term and convert to lowercase for case-insensitive matching
+    const searchTerm = document.getElementById('searchCrypto').value.toLowerCase().trim();
+    const items = document.querySelectorAll('.crypto-item');
+
+    // Filter cryptocurrency items based on search term
+    items.forEach(item => {
+        const cryptoName = item.textContent.toLowerCase();
+        // Show or hide based on whether the name contains the search term
+        item.style.display = cryptoName.includes(searchTerm) ? 'flex' : 'none';
     });
 }
 
@@ -156,15 +162,19 @@ async function fetchCryptoData() {
 
         // Check if we received valid data
         if (data.data && data.data.length > 0) {
+            // Keep the current selection with its fresh values, or fall back to
+            // the first cryptocurrency if it is no longer listed
+            const selected = currentSelectedCrypto &&
+                data.data.find(crypto => crypto.symbol === currentSelectedCrypto.symbol);
+            currentSelectedCrypto = selected || data.data[0];
+
             // Update the cryptocurrency list with new data
             updateCryptoList(data.data);
+            applyCryptoSearch();
             // Update the last updated timestamp
             updateLastUpdated();
 
-            // Auto-select the first cryptocurrency if none is currently selected
-            if (!currentSelectedCrypto) {
-                selectCrypto(data.data[0]);
-            }
+            selectCrypto(currentSelectedCrypto);
         } else {
             // Show error if no data was received
             showError(document.getElementById('cryptoList'), 'No data available');
@@ -237,20 +247,23 @@ function updateCryptoList(cryptos) {
             cryptoItem.classList.add('active');
         }
 
+        const change = crypto.percent_change_24h;
+        const changeClass = change == null ? '' : change >= 0 ? 'positive' : 'negative';
+
         cryptoItem.innerHTML = `
             <div class="crypto-info">
                 <div class="crypto-icon">
                     ${getCryptoIcon(crypto.symbol, 'crypto-svg-icon')}
                 </div>
                 <div>
-                    <div class="crypto-name">${crypto.name}</div>
-                    <div class="crypto-symbol">${crypto.symbol}</div>
+                    <div class="crypto-name">${escapeHtml(crypto.name)}</div>
+                    <div class="crypto-symbol">${escapeHtml(crypto.symbol)}</div>
                 </div>
             </div>
             <div class="crypto-details">
                 <div class="crypto-price">$${formatPrice(crypto.price)}</div>
-                <div class="crypto-change ${crypto.percent_change_24h >= 0 ? 'positive' : 'negative'}">
-                    ${crypto.percent_change_24h >= 0 ? '+' : ''}${crypto.percent_change_24h.toFixed(2)}%
+                <div class="crypto-change ${changeClass}">
+                    ${formatChange(change)}
                 </div>
             </div>
         `;
@@ -272,6 +285,11 @@ function formatPrice(price) {
     });
 }
 
+function formatChange(change) {
+    if (change == null) return 'N/A';
+    return `${change >= 0 ? '+' : ''}${change.toFixed(2)}%`;
+}
+
 function selectCrypto(crypto) {
     currentSelectedCrypto = crypto;
 
@@ -280,8 +298,8 @@ function selectCrypto(crypto) {
 
     // Update the stats
     document.getElementById('currentPrice').textContent = `$${formatPrice(crypto.price)}`;
-    document.getElementById('marketCap').textContent = formatMarketCap(crypto.market_cap);
-    document.getElementById('volume24h').textContent = formatVolume(crypto.volume_24h);
+    document.getElementById('marketCap').textContent = formatUsdAmount(crypto.market_cap);
+    document.getElementById('volume24h').textContent = formatUsdAmount(crypto.volume_24h);
 
     // Update the price change badge
     updatePriceChangeBadge(crypto.percent_change_24h);
@@ -290,22 +308,14 @@ function selectCrypto(crypto) {
     fetchHistoricalData(crypto.symbol, currentTimeframe);
 }
 
-function formatMarketCap(marketCap) {
-    // The market cap values are already in billions, so we need to adjust our thresholds
-    if (marketCap >= 1000) return `$${(marketCap / 1000).toFixed(2)} Trillion USD`;
-    if (marketCap >= 1) return `$${marketCap.toFixed(2)} Billion USD`;
-    if (marketCap >= 0.001) return `$${(marketCap * 1000).toFixed(2)} Million USD`;
-    if (marketCap >= 0.000001) return `$${(marketCap * 1000000).toFixed(2)} Thousand USD`;
-    return `$${formatPrice(marketCap)} USD`;
-}
-
-function formatVolume(volume) {
-    // The volume values are already in billions, so we need to adjust our thresholds
-    if (volume >= 1000) return `$${(volume / 1000).toFixed(2)} Trillion USD`;
-    if (volume >= 1) return `$${volume.toFixed(2)} Billion USD`;
-    if (volume >= 0.001) return `$${(volume * 1000).toFixed(2)} Million USD`;
-    if (volume >= 0.000001) return `$${(volume * 1000000).toFixed(2)} Thousand USD`;
-    return `$${formatPrice(volume)} USD`;
+function formatUsdAmount(amount) {
+    // Market cap and volume are stored in raw USD.
+    if (amount == null) return 'N/A';
+    if (amount >= 1e12) return `$${(amount / 1e12).toFixed(2)} Trillion USD`;
+    if (amount >= 1e9) return `$${(amount / 1e9).toFixed(2)} Billion USD`;
+    if (amount >= 1e6) return `$${(amount / 1e6).toFixed(2)} Million USD`;
+    if (amount >= 1e3) return `$${(amount / 1e3).toFixed(2)} Thousand USD`;
+    return `$${formatPrice(amount)} USD`;
 }
 
 function updatePriceChangeBadge(change) {
@@ -313,9 +323,12 @@ function updatePriceChangeBadge(change) {
     const changeValue = changeBadge.querySelector('.change-value');
     const changeIcon = changeBadge.querySelector('.change-icon');
 
-    changeValue.textContent = `${change >= 0 ? '+' : ''}${change.toFixed(2)}%`;
+    changeValue.textContent = formatChange(change);
 
-    if (change >= 0) {
+    if (change == null) {
+        changeBadge.className = 'price-change';
+        changeIcon.innerHTML = '';
+    } else if (change >= 0) {
         changeBadge.className = 'price-change positive';
         changeIcon.innerHTML = `<svg class="change-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512" width="1em" height="1em">
             <path fill="currentColor" d="M214.6 41.4c-12.5-12.5-32.8-12.5-45.3 0l-160 160c-12.5 12.5-12.5 32.8 0 45.3s32.8 12.5 45.3 0L160 141.2V448c0 17.7 14.3 32 32 32s32-14.3 32-32V141.2L329.4 246.6c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3l-160-160z"/>
@@ -338,6 +351,7 @@ function updatePriceChangeBadge(change) {
 const TIMEFRAME_DAYS = {
     '24h': 1,
     '7d': 7,
+    '14d': 14,
     '1m': 30,
     '3m': 90,
     '1y': 365
@@ -345,26 +359,43 @@ const TIMEFRAME_DAYS = {
 
 async function fetchHistoricalData(symbol, timeframe = '24h') {
     const chartCanvas = document.getElementById('priceChart');
+    const signal = nextHistorySignal();
     showChartLoading(chartCanvas);
 
     try {
         const days = TIMEFRAME_DAYS[timeframe] || 1;
         const response = await fetch(
-            `${API_BASE_URL}/api/crypto/${symbol}/history?days=${days}`
+            `${API_BASE_URL}/api/crypto/${encodeURIComponent(symbol)}/history?days=${days}`,
+            { signal }
         );
         if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
 
         const data = await response.json();
 
+        if (!data.timestamps || data.timestamps.length === 0) {
+            clearPriceChart();
+            showChartError(chartCanvas, 'No price history for this range yet');
+            return;
+        }
+
         // The response is already restricted to the requested window and
         // thinned out, so it can be charted as received.
         updatePriceChart(
-            { timestamps: data.timestamps || [], prices: data.prices || [] },
+            { timestamps: data.timestamps, prices: data.prices || [] },
             timeframe
         );
     } catch (error) {
+        if (isAbortError(error)) return;
 
+        clearPriceChart();
         showChartError(chartCanvas, 'Failed to load historical data');
+    }
+}
+
+function clearPriceChart() {
+    if (priceChart) {
+        priceChart.destroy();
+        priceChart = null;
     }
 }
 
@@ -397,12 +428,13 @@ function updatePriceChart(historyData, timeframe) {
 
     // Format dates based on timeframe
     const formattedDates = historyData.timestamps.map(timestamp => {
-        const date = new Date(timestamp);
+        const date = parseServerTime(timestamp);
 
         switch(timeframe) {
             case '24h':
                 return date.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
             case '7d':
+            case '14d':
             case '1m':
             case '3m':
                 return date.toLocaleDateString([], {month: 'short', day: 'numeric'});
@@ -454,7 +486,7 @@ function updatePriceChart(historyData, timeframe) {
                         return `Price: $${context.parsed.y.toFixed(6)}`;
                     },
                     title: function(context) {
-                        return new Date(historyData.timestamps[context[0].dataIndex]).toLocaleString();
+                        return parseServerTime(historyData.timestamps[context[0].dataIndex]).toLocaleString();
                     }
                 }
             },
@@ -509,6 +541,10 @@ function updatePriceChart(historyData, timeframe) {
     };
 
     if (priceChart) {
+        // A zoom level from the previous range would not fit the new data.
+        if (typeof priceChart.resetZoom === 'function') {
+            priceChart.resetZoom('none');
+        }
         priceChart.data = chartData;
         priceChart.options = chartOptions;
         priceChart.update();

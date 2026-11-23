@@ -1,6 +1,12 @@
 <!DOCTYPE html>
 <html lang="en" data-theme="dark">
 <head>
+    <script>
+        // Apply the saved theme before first paint to avoid a flash of the wrong one
+        try {
+            document.documentElement.setAttribute('data-theme', localStorage.getItem('theme') || 'dark');
+        } catch (error) {}
+    </script>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>CryptoViz | Cryptocurrency Volatility Analysis</title>
@@ -84,6 +90,7 @@
                 <div class="card-body">
                     <h5 class="card-title">Select Time Range</h5>
                     <div class="time-range-buttons">
+                        <button class="time-range-button" data-days="1">24 Hours</button>
                         <button class="time-range-button active" data-days="7">7 Days</button>
                         <button class="time-range-button" data-days="14">14 Days</button>
                         <button class="time-range-button" data-days="30">30 Days</button>
@@ -162,8 +169,8 @@
 
                             <h5>How is Volatility Calculated?</h5>
                             <p>
-                                The volatility shown here is calculated as the standard deviation of daily returns over the selected time period.
-                                It represents the average percentage that a cryptocurrency's price deviates from its mean price.
+                                The volatility shown here is realized daily volatility: price returns over the selected period,
+                                scaled by the time they span. It estimates a typical one-day price move, so values can be compared across time ranges.
                             </p>
 
                             <h5>What is Maximum Drawdown?</h5>
@@ -216,7 +223,7 @@
     </div>
 
     <!-- Scripts -->
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.9/dist/chart.umd.js" integrity="sha384-4W8gMhOYqk0FPg9sAMkb3g/P2fXtzbUyDUUgMlA1EEig8z/U/13EYUjErc1H382b" crossorigin="anonymous"></script>
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
     <script src="/js/icons.js"></script>
     <script src="/js/config.js"></script>

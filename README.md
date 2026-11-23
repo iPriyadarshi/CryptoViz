@@ -16,11 +16,11 @@ frontend from a single Flask application.
 ## Features
 
 - **Live price tracking** for the top 10 cryptocurrencies by market cap
-- **Historical charts** over 24 h / 7 d / 1 month
+- **Historical charts** over 24 h, 7, 14, 30 and 90 days, and 1 year
 - **Normalized trend comparison** — compare assets on a common scale
-- **Volatility metrics** — return dispersion and maximum drawdown
+- **Volatility metrics** — realized daily volatility and maximum drawdown
 - **Correlation matrix** — how assets move relative to one another
-- **Market sentiment** — crypto news and Reddit scored with VADER, blended with the Fear & Greed Index
+- **Market sentiment** — crypto news feeds and Reddit scored with VADER, blended with the Fear & Greed Index
 - **Top gainers** over the last 24 hours
 - **Light and dark themes**
 
@@ -48,7 +48,7 @@ lands. To seed data without waiting:
 
 ```bash
 uv run cryptoviz-scrape-once   # one round of every scraper
-uv run cryptoviz-backfill      # 31 days of price history (several minutes)
+uv run cryptoviz-backfill      # 31 days of hourly price history (several minutes)
 ```
 
 ### Commands
@@ -85,8 +85,8 @@ CryptoViz/
 │   │   └── updater.py        # background collection loops
 │   ├── scrapers/             # one module per external source
 │   │   ├── base.py           #   shared HTTP + parsing helpers
-│   │   ├── prices.py         #   CoinMarketCap → CoinGecko
-│   │   ├── top_gainers.py    #   CoinMarketCap → CoinGecko
+│   │   ├── prices.py         #   CoinGecko
+│   │   ├── top_gainers.py    #   CoinGecko
 │   │   ├── sentiment.py      #   news, Reddit, Fear & Greed
 │   │   └── historical.py     #   one-off backfill
 │   ├── db/
@@ -133,28 +133,30 @@ instead of failing).
 
 | Data | Primary | Fallback |
 |---|---|---|
-| Prices | CoinMarketCap | CoinGecko API |
-| Top gainers | CoinMarketCap | CoinGecko API |
-| News sentiment | CoinDesk, Cointelegraph, CryptoNews | RSS feeds |
+| Prices | CoinGecko API | — |
+| Top gainers | CoinGecko API | — |
+| News sentiment | RSS: Cointelegraph, CoinDesk, Bitcoin.com, CryptoNews, Bitcoinist | — |
 | Social sentiment | Reddit r/CryptoCurrency | — |
-| Fear & Greed Index | alternative.me | neutral (50) |
+| Fear & Greed Index | alternative.me | — |
 
 Overall sentiment is a weighted blend: **50 % news + 30 % Reddit + 20 % Fear &
-Greed**. Every scraper degrades gracefully — a failed source logs a warning and
-falls through rather than taking the run down.
+Greed**. A source that returns nothing is left out and the remaining weights are
+renormalized. If every source fails, nothing is stored and the last good reading
+stays current.
 
 ### Database schema
 
 | Table | Contents |
 |---|---|
 | `crypto_prices` | Normalized time-series price rows (history, volatility, correlation) |
-| `price_buckets` | Hourly and daily averages of the above, maintained by the worker |
+| `price_buckets` | Hourly and daily average, close, low and high of the above, maintained by the worker |
 | `sentiment_snapshots` | Aggregate sentiment readings, one row per scrape |
 | `sentiment_sources` | The articles and posts behind those scores, stored once each |
 | `sentiment_source_mentions` | Which cryptocurrencies each source mentions |
 | `top_gainers_snapshots` | One JSON list per top-gainers scrape |
 
-Timestamps are stored as text in `%Y-%m-%d %H:%M:%S` — zero-padded and
+Market cap and volume are stored in USD. Timestamps are UTC, stored as text in
+`%Y-%m-%d %H:%M:%S` — zero-padded and
 most-significant-first, so lexicographic comparison is also chronological, which
 lets time-range filters run as plain SQL string comparisons.
 
@@ -171,7 +173,7 @@ from 22.5 MB to 0.5 MB — roughly **3 GB → 25 MB** extrapolated to a full yea
 
 A year of 5-minute readings is ~105,000 points per symbol, so windows longer
 than a week are served from **pre-aggregated rollups** rather than re-aggregated
-on every request. `price_buckets` holds hourly and daily averages of
+on every request. `price_buckets` holds hourly and daily summaries of
 `crypto_prices`; the worker rebuilds it at startup and refreshes a two-day
 trailing window after each scrape. Reads fall back to aggregating raw rows when
 the rollup has not been built yet, so a fresh deployment is correct immediately,
@@ -210,17 +212,16 @@ incremental refresh is ~255 ms in the background worker.
 | `GET /api/crypto/volatility` | Volatility for all cryptocurrencies |
 | `GET /api/crypto/correlation` | Correlation matrix |
 | `GET /api/sentiment` | Latest complete sentiment snapshot |
-| `GET /api/sentiment/overall` | Overall market sentiment (`?days=1\|7\|30`) |
+| `GET /api/sentiment/overall` | Overall market sentiment (`?days=1\|7\|14\|30\|90\|365`) |
 | `GET /api/sentiment/rankings` | Most positive / negative by sentiment |
 | `GET /api/sentiment/sources` | Raw sources (`?type=`, `?crypto=`, `?limit=`, `?days=`) |
 | `GET /api/sentiment/trends` | Sentiment plotted against price over time |
 | `GET /api/top-gainers` | Latest top gainers |
-| `GET /api/top-gainers/update` | Trigger a top gainers refresh |
-| `GET /api/sentiment/update` | Trigger a sentiment refresh |
 | `GET /healthz` | Liveness probe |
 
-Endpoints taking `days` accept 1, 7, 14, 30, 90 or 365; anything else falls back
-to the default. A browsable summary is served at `/api-docs`.
+The API is read-only: only the worker scrapes or writes data. All timestamps are
+UTC. Endpoints taking `days` accept 1, 7, 14, 30, 90 or 365; anything else falls
+back to the default. A browsable summary is served at `/api-docs`.
 
 ## Configuration
 
@@ -264,7 +265,7 @@ directory. Subsequent deploys are `sudo bash deploy/update.sh`.
 
 ```bash
 uv sync                          # includes dev dependencies
-uv run pytest                    # 65 tests
+uv run pytest                    # test suite
 uv run ruff check src tests      # lint
 uv run ruff format src tests     # format
 ```

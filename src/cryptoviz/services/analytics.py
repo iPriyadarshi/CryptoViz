@@ -15,22 +15,26 @@ Two rules keep this affordable now that a full year of 5-minute data is kept:
 """
 
 import logging
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import numpy as np
 import pandas as pd
 
 from .. import config
 from ..db import repository as db
+from ..db.models import utc_now
 
 logger = logging.getLogger(__name__)
 
 # Assets whose price is pegged, so correlation against them is meaningless.
 STABLECOINS = ("usdt", "usdc")
 
-# Below this coefficient of variation an asset is treated as pegged even if it
-# is not in the list above.
-STABLECOIN_CV_THRESHOLD = 0.001
+# An asset that never strays this far from $1 is treated as pegged even if it is
+# not in the list above.
+PEG_TOLERANCE = 0.02
+
+# Fewest shared return observations a correlation pair needs to be reported.
+MIN_CORRELATION_OBSERVATIONS = 5
 
 # Minimum spacing between retained history points, in seconds. Consecutive rows
 # with an unchanged price are dropped unless this much time has passed, which
@@ -53,6 +57,21 @@ def bucket_for_window(days):
     if days > config.HOURLY_BUCKET_THRESHOLD_DAYS:
         return "hour"
     return None
+
+
+def trend_bucket_for_window(days):
+    """
+    Choose the granularity for a sentiment trend chart.
+
+    Args:
+        days (int): Size of the requested window in days.
+
+    Returns:
+        str | None: 'day', 'hour', or None to plot every snapshot.
+    """
+    if days <= 1:
+        return None
+    return "hour" if days <= 14 else "day"
 
 
 def get_latest_data():
@@ -85,7 +104,7 @@ def get_history(symbol, days=None):
     if days is None or days <= 0:
         days = config.PRICE_RETENTION_DAYS
 
-    cutoff = datetime.now() - timedelta(days=days)
+    cutoff = utc_now() - timedelta(days=days)
     df = db.get_prices_df(symbol, since=cutoff, bucket=bucket_for_window(days))
     if df.empty:
         return {"prices": [], "timestamps": []}
@@ -119,6 +138,47 @@ def get_history(symbol, days=None):
     }
 
 
+def _risk_metrics(series):
+    """
+    Calculate daily volatility and maximum drawdown for one sorted series.
+
+    Volatility is realized volatility: squared log returns of the closing prices
+    divided by the time they span, then expressed per day. Dividing by elapsed
+    time keeps the figure comparable between 5-minute, hourly and daily data, and
+    across gaps in collection.
+
+    Drawdown compares each period's low against the highest price before it, and
+    its close against its own high, so a crash inside a bucket is not averaged
+    away.
+
+    Args:
+        series (pandas.DataFrame): rows with timestamp, close, low and high.
+
+    Returns:
+        tuple[float, float]: (daily volatility %, max drawdown %), each rounded
+        to two decimals. Zeros when there are fewer than two points.
+    """
+    if len(series) < 2:
+        return 0.0, 0.0
+
+    log_returns = np.log(series["close"]).diff()
+    elapsed_days = series["timestamp"].diff().dt.total_seconds() / 86400
+    usable = log_returns.notna() & (elapsed_days > 0)
+    total_days = elapsed_days[usable].sum()
+
+    volatility = 0.0
+    if total_days > 0:
+        volatility = float(np.sqrt((log_returns[usable] ** 2).sum() / total_days) * 100)
+
+    prior_peak = series["high"].cummax().shift(1)
+    falls = pd.concat(
+        [series["low"] / prior_peak - 1, series["close"] / series["high"] - 1], axis=1
+    )
+    max_drawdown = min(float(falls.min().min()) * 100, 0.0)
+
+    return round(volatility, 2), round(max_drawdown, 2)
+
+
 def calculate_volatility(symbol, days=7):
     """
     Calculate volatility metrics for one cryptocurrency over a time window.
@@ -129,7 +189,9 @@ def calculate_volatility(symbol, days=7):
 
     Returns:
         dict: {'volatility', 'max_drawdown', 'daily_returns', 'timestamps'}.
-        Zeros and empty lists when there is not enough data.
+        'volatility' is per day; 'daily_returns' holds the percentage return
+        of each period in the series. Zeros and empty lists when there is not
+        enough data.
     """
     empty = {
         "volatility": 0,
@@ -138,37 +200,30 @@ def calculate_volatility(symbol, days=7):
         "timestamps": [],
     }
 
-    cutoff = datetime.now() - timedelta(days=days)
+    cutoff = utc_now() - timedelta(days=days)
     df = db.get_prices_df(symbol, since=cutoff, bucket=bucket_for_window(days))
     if df.empty or len(df) < 2:
         return empty
 
     df = df.sort_values("timestamp")
+    volatility, max_drawdown = _risk_metrics(df)
 
-    # Period-over-period returns between consecutive observations.
-    df["daily_return"] = df["price"].pct_change() * 100
-    df = df.dropna(subset=["daily_return"])
-    if df.empty:
-        return empty
-
-    volatility = float(np.std(df["daily_return"]))
-
-    # Maximum drawdown: the largest drop from a running peak.
-    running_max = df["price"].cummax()
-    drawdown = (df["price"] - running_max) / running_max * 100
-    max_drawdown = float(drawdown.min())
+    returns = df["close"].pct_change() * 100
+    usable = returns.notna()
 
     return {
-        "volatility": round(volatility, 2),
-        "max_drawdown": round(max_drawdown, 2),
-        "daily_returns": df["daily_return"].tolist(),
-        "timestamps": df["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S").tolist(),
+        "volatility": volatility,
+        "max_drawdown": max_drawdown,
+        "daily_returns": returns[usable].tolist(),
+        "timestamps": df.loc[usable, "timestamp"]
+        .dt.strftime("%Y-%m-%d %H:%M:%S")
+        .tolist(),
     }
 
 
 def get_all_volatility(days=7):
     """
-    Get volatility metrics for every tracked cryptocurrency.
+    Get volatility metrics for every currently tracked cryptocurrency.
 
     Args:
         days (int, optional): Size of the window in days.
@@ -177,28 +232,23 @@ def get_all_volatility(days=7):
         list[dict]: One entry per cryptocurrency, sorted by volatility
         descending. Empty when there is no data.
     """
-    cutoff = datetime.now() - timedelta(days=days)
+    cutoff = utc_now() - timedelta(days=days)
     df = db.get_prices_df(since=cutoff, bucket=bucket_for_window(days))
     if df.empty:
         return []
 
+    # The headline price comes from the newest raw row, and a coin that has
+    # left the top 10 is not listed with its stale price.
+    latest_rows = {row["symbol"]: row for row in db.get_latest_prices()}
+
     results = []
     for symbol, group in df.groupby("symbol"):
-        try:
-            group = group.sort_values("timestamp")
-            latest = group.iloc[-1]
+        latest = latest_rows.get(symbol)
+        if latest is None:
+            continue
 
-            # Derive the metrics from the slice already in memory rather than
-            # issuing another query per symbol.
-            returns = group["price"].pct_change().dropna() * 100
-            if len(returns) >= 1:
-                volatility = round(float(np.std(returns)), 2)
-                running_max = group["price"].cummax()
-                drawdown = (group["price"] - running_max) / running_max * 100
-                max_drawdown = round(float(drawdown.min()), 2)
-            else:
-                volatility = 0.0
-                max_drawdown = 0.0
+        try:
+            volatility, max_drawdown = _risk_metrics(group.sort_values("timestamp"))
 
             results.append(
                 {
@@ -207,7 +257,7 @@ def get_all_volatility(days=7):
                     "price": float(latest["price"]),
                     "volatility": volatility,
                     "max_drawdown": max_drawdown,
-                    "percent_change_24h": float(latest["percent_change_24h"] or 0),
+                    "percent_change_24h": latest["percent_change_24h"],
                 }
             )
         except Exception as exc:
@@ -217,14 +267,20 @@ def get_all_volatility(days=7):
     return sorted(results, key=lambda item: item["volatility"], reverse=True)
 
 
+def _is_pegged(prices):
+    """Whether a price series stays within PEG_TOLERANCE of $1."""
+    return bool(((prices - 1).abs() <= PEG_TOLERANCE).all())
+
+
 def calculate_correlation_matrix(days=7):
     """
     Calculate the price-return correlation matrix across cryptocurrencies.
 
     Correlation is computed on returns rather than prices, so it reflects
-    co-movement instead of shared trend. Stablecoins and any asset whose price
-    barely varies are excluded, since a near-constant series produces a
-    meaningless (or undefined) correlation.
+    co-movement instead of shared trend. Each pair uses every observation the
+    two assets share, so a newly listed coin cannot shrink the sample for the
+    others; a pair with too few shared observations is null. Pegged assets and
+    series that never move are excluded, since their correlation is meaningless.
 
     Args:
         days (int, optional): Size of the window in days.
@@ -235,63 +291,44 @@ def calculate_correlation_matrix(days=7):
     """
     empty = {"correlation_matrix": [], "symbols": []}
 
-    try:
-        cutoff = datetime.now() - timedelta(days=days)
-        df = db.get_prices_df(since=cutoff, bucket=bucket_for_window(days))
-        if df.empty or len(df) < 2:
-            return empty
-
-        # One column per symbol, one row per observation time.
-        pivot = df.pivot_table(
-            index="timestamp", columns="symbol", values="price", aggfunc="mean"
-        )
-
-        pivot = pivot.drop(
-            columns=[c for c in STABLECOINS if c in pivot.columns], errors="ignore"
-        )
-
-        # Keep symbols that have enough observations and enough price variation.
-        valid_symbols = []
-        for symbol in pivot.columns:
-            series = pivot[symbol]
-            if series.count() < 2:
-                continue
-
-            mean = series.mean()
-            cv = 0 if not mean else series.std() / mean
-            if cv < STABLECOIN_CV_THRESHOLD:
-                logger.debug("Skipping %s: price variation too low (cv=%.6f)", symbol, cv)
-                continue
-
-            valid_symbols.append(symbol)
-
-        if len(valid_symbols) < 2:
-            logger.info("Not enough symbols with usable price variation for correlation")
-            return empty
-
-        pivot = pivot[valid_symbols]
-
-        # Forward-fill gaps so a missing observation for one asset does not drop
-        # the whole timestamp, then take returns.
-        returns = pivot.ffill().pct_change(fill_method=None).dropna()
-        if len(returns) < 2 or len(returns.columns) < 2:
-            logger.info("Not enough return observations for correlation")
-            return empty
-
-        corr = returns.corr().round(2)
-
-        # NaN is not valid JSON; the API contract uses null for an undefined
-        # correlation pair.
-        matrix = [
-            [None if pd.isna(value) else float(value) for value in row]
-            for row in corr.to_numpy()
-        ]
-
-        return {"correlation_matrix": matrix, "symbols": corr.columns.tolist()}
-
-    except Exception as exc:
-        logger.error("Correlation calculation failed: %s", exc)
+    cutoff = utc_now() - timedelta(days=days)
+    df = db.get_prices_df(since=cutoff, bucket=bucket_for_window(days))
+    if df.empty or len(df) < 2:
         return empty
+
+    # One column per symbol, one row per observation time.
+    pivot = df.pivot_table(
+        index="timestamp", columns="symbol", values="close", aggfunc="last"
+    )
+    pivot = pivot.drop(
+        columns=[c for c in STABLECOINS if c in pivot.columns], errors="ignore"
+    )
+
+    # A gap stays a gap: filling it would invent a run of zero returns.
+    returns = pivot.pct_change(fill_method=None)
+
+    valid_symbols = [
+        symbol
+        for symbol in pivot.columns
+        if returns[symbol].count() >= MIN_CORRELATION_OBSERVATIONS
+        and returns[symbol].std() > 0
+        and not _is_pegged(pivot[symbol].dropna())
+    ]
+
+    if len(valid_symbols) < 2:
+        logger.info("Not enough symbols with usable price variation for correlation")
+        return empty
+
+    corr = returns[valid_symbols].corr(min_periods=MIN_CORRELATION_OBSERVATIONS).round(2)
+
+    # NaN is not valid JSON; the API contract uses null for an undefined
+    # correlation pair.
+    matrix = [
+        [None if pd.isna(value) else float(value) for value in row]
+        for row in corr.to_numpy()
+    ]
+
+    return {"correlation_matrix": matrix, "symbols": corr.columns.tolist()}
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +376,28 @@ def price_at(series, timestamp):
     return float(series.loc[deltas.idxmin(), "price"])
 
 
+def prices_at(series, timestamps):
+    """
+    Find the nearest price for each of many sorted timestamps at once.
+
+    Args:
+        series (pandas.DataFrame): Output of get_price_series().
+        timestamps (list[datetime]): Target times, oldest first.
+
+    Returns:
+        list[float | None]: One price per timestamp; all None for an empty series.
+    """
+    if series is None or series.empty:
+        return [None] * len(timestamps)
+
+    targets = pd.DataFrame({"timestamp": pd.to_datetime(timestamps)})
+    targets["timestamp"] = targets["timestamp"].astype("datetime64[ns]")
+    prices = series.assign(timestamp=series["timestamp"].astype("datetime64[ns]"))
+
+    merged = pd.merge_asof(targets, prices, on="timestamp", direction="nearest")
+    return merged["price"].astype(float).tolist()
+
+
 def cleanup_old_data():
     """
     Remove price data older than the configured retention window.
@@ -346,7 +405,7 @@ def cleanup_old_data():
     Prunes the rollup buckets alongside the raw rows, so a bucket never outlives
     the data it summarizes.
     """
-    cutoff = datetime.now() - timedelta(days=config.PRICE_RETENTION_DAYS)
+    cutoff = utc_now() - timedelta(days=config.PRICE_RETENTION_DAYS)
     removed = db.delete_prices_before(cutoff)
     removed_buckets = db.delete_price_buckets_before(cutoff)
     if removed or removed_buckets:

@@ -8,9 +8,10 @@ handling and the numeric parsing they all need live here.
 
 import logging
 import re
-from datetime import datetime
 
 import requests
+
+from ..db.models import TIMESTAMP_FORMAT, utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -73,8 +74,8 @@ class BaseScraper:
         self.headers = {"User-Agent": DEFAULT_USER_AGENT}
 
     def get_current_timestamp(self):
-        """Return the current time in the application's timestamp format."""
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        """Return the current UTC time in the application's timestamp format."""
+        return utc_now().strftime(TIMESTAMP_FORMAT)
 
     def make_request(self, url, params=None, timeout=15):
         """

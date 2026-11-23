@@ -30,8 +30,10 @@ Timestamps are stored as text in TIMESTAMP_FORMAT rather than as a native date
 type. The format is zero-padded and most-significant-first, so lexicographic
 comparison is also chronological comparison - that is what lets the repository
 filter by time range with a plain string comparison, and what lets a prefix of
-the string act as a truncation to the hour or the day.
+the string act as a truncation to the hour or the day. All stored times are UTC.
 """
+
+from datetime import UTC, datetime
 
 from sqlalchemy import (
     Column,
@@ -55,6 +57,12 @@ TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 HOUR_PREFIX_LENGTH = 13
 DAY_PREFIX_LENGTH = 10
 
+
+def utc_now():
+    """Return the current UTC time as the naive datetime the database stores."""
+    return datetime.now(UTC).replace(tzinfo=None)
+
+
 metadata = MetaData()
 
 crypto_prices = Table(
@@ -68,7 +76,8 @@ crypto_prices = Table(
     Column("volume_24h", Float),
     Column("percent_change_24h", Float),
     Column("timestamp", String(32), nullable=False),
-    Index("ix_crypto_prices_symbol_ts", "symbol", "timestamp"),
+    # Unique so that loading the same history twice cannot create duplicates.
+    Index("uq_crypto_prices_symbol_ts", "symbol", "timestamp", unique=True),
     Index("ix_crypto_prices_ts", "timestamp"),
 )
 
@@ -108,6 +117,12 @@ price_buckets = Table(
     Column("market_cap", Float),
     Column("volume_24h", Float),
     Column("percent_change_24h", Float),
+    # `price` is the bucket average, which suits a chart. Returns and drawdown
+    # need the real last, lowest and highest prices, because an average hides
+    # a crash that happens inside the bucket.
+    Column("close", Float),
+    Column("low", Float),
+    Column("high", Float),
     UniqueConstraint(
         "granularity", "symbol", "timestamp", name="uq_price_buckets_identity"
     ),

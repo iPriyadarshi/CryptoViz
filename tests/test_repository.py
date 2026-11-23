@@ -6,7 +6,10 @@ timestamps round-trip through the text format, that the `since` filter really
 narrows the result, and that retention deletes only what it should.
 """
 
+import sqlite3
 from datetime import datetime, timedelta
+
+import pytest
 
 from cryptoviz.db import repository as repo
 
@@ -26,6 +29,70 @@ def test_save_prices_ignores_empty_batch(clean_db):
     """An empty batch is a no-op rather than an error."""
     repo.save_prices([])
     assert repo.get_prices_df().empty
+
+
+def test_saving_the_same_rows_twice_creates_no_duplicates(clean_db, price_rows):
+    """Re-running a backfill updates rows instead of doubling them."""
+    repo.save_prices(price_rows)
+    repo.save_prices(price_rows)
+
+    assert repo.count_prices() == len(price_rows)
+
+
+@pytest.mark.parametrize("price", [0, -1, None, float("nan"), float("inf")])
+def test_save_prices_rejects_unusable_prices(clean_db, price):
+    """A bad price is skipped, and non-finite extras are stored as NULL."""
+    timestamp = "2026-01-01 00:00:00"
+    good = {"symbol": "btc", "price": 100.0, "timestamp": timestamp}
+    good["percent_change_24h"] = float("nan")
+    bad = {"symbol": "eth", "price": price, "timestamp": timestamp}
+
+    assert repo.save_prices([good, bad]) == 1
+
+    rows = repo.get_latest_prices()
+    assert [row["symbol"] for row in rows] == ["btc"]
+    assert rows[0]["percent_change_24h"] is None
+
+
+def test_init_db_migrates_the_old_price_index(tmp_path, monkeypatch):
+    """An existing database loses its duplicates and gains the unique index."""
+    from cryptoviz import config
+    from cryptoviz.db import engine as db_engine
+
+    path = tmp_path / "legacy.db"
+    legacy = sqlite3.connect(path)
+    legacy.executescript(
+        """
+        CREATE TABLE crypto_prices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, symbol VARCHAR(32) NOT NULL,
+            name VARCHAR(128), price FLOAT, market_cap FLOAT, volume_24h FLOAT,
+            percent_change_24h FLOAT, timestamp VARCHAR(32) NOT NULL
+        );
+        CREATE INDEX ix_crypto_prices_symbol_ts ON crypto_prices (symbol, timestamp);
+        INSERT INTO crypto_prices (symbol, price, timestamp) VALUES
+            ('btc', 1.0, '2026-01-01 00:00:00'),
+            ('btc', 2.0, '2026-01-01 00:00:00'),
+            ('eth', 3.0, '2026-01-01 00:00:00');
+        """
+    )
+    legacy.close()
+
+    monkeypatch.setattr(config, "DB_PATH", path)
+    monkeypatch.setattr(db_engine, "_engine", None)
+    db_engine.init_db()
+    db_engine.init_db()  # A second start must be a no-op.
+    db_engine.get_engine().dispose()
+
+    check = sqlite3.connect(path)
+    rows = check.execute(
+        "SELECT symbol, price FROM crypto_prices ORDER BY symbol"
+    ).fetchall()
+    indexes = {row[1] for row in check.execute("PRAGMA index_list(crypto_prices)")}
+    check.close()
+
+    assert rows == [("btc", 2.0), ("eth", 3.0)]
+    assert "uq_crypto_prices_symbol_ts" in indexes
+    assert "ix_crypto_prices_symbol_ts" not in indexes
 
 
 def test_since_filter_narrows_results(clean_db, price_rows):

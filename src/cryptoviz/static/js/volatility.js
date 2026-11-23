@@ -3,6 +3,8 @@
 // Global variables
 let volatilityChart;
 let selectedTimeRange = '7'; // Match the data-days attribute in the HTML
+let chartResizeObserver = null;
+const nextVolatilitySignal = createRequestTracker();
 
 // Function to check if all required elements exist
 function checkRequiredElements() {
@@ -249,6 +251,8 @@ function setupTimeRangeButtons() {
 
 // Fetch volatility data from API
 async function fetchVolatilityData() {
+    const signal = nextVolatilitySignal();
+
     try {
         const volatilityTable = document.getElementById('volatilityTable');
         const chartContainer = document.getElementById('volatilityChartContainer');
@@ -261,7 +265,7 @@ async function fetchVolatilityData() {
             showLoading(chartContainer);
         }
 
-        const response = await fetch(`${API_BASE_URL}/api/crypto/volatility?days=${selectedTimeRange}`);
+        const response = await fetch(`${API_BASE_URL}/api/crypto/volatility?days=${selectedTimeRange}`, { signal });
         if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
 
         const data = await response.json();
@@ -272,6 +276,7 @@ async function fetchVolatilityData() {
             updateVolatilityChart(data.data);
             updateLastUpdated();
         } else {
+            clearVolatilityChart();
             if (volatilityTable) {
                 showError(volatilityTable, 'No volatility data available');
             }
@@ -280,7 +285,9 @@ async function fetchVolatilityData() {
             }
         }
     } catch (error) {
+        if (isAbortError(error)) return;
 
+        clearVolatilityChart();
         const volatilityTable = document.getElementById('volatilityTable');
         const chartContainer = document.getElementById('volatilityChartContainer');
 
@@ -290,6 +297,14 @@ async function fetchVolatilityData() {
         if (chartContainer) {
             showError(chartContainer, 'Failed to load volatility data');
         }
+    }
+}
+
+// Remove the chart so an old range is not left behind a message
+function clearVolatilityChart() {
+    if (volatilityChart) {
+        volatilityChart.destroy();
+        volatilityChart = null;
     }
 }
 
@@ -355,8 +370,8 @@ function updateVolatilityTable(data) {
             row.innerHTML = `
                 <td>${index + 1}</td>
                 <td class="crypto-name">
-                    <span>${crypto.name}</span>
-                    <small>${crypto.symbol.toUpperCase()}</small>
+                    <span>${escapeHtml(crypto.name)}</span>
+                    <small>${escapeHtml(crypto.symbol.toUpperCase())}</small>
                 </td>
                 <td>${formattedPrice}</td>
                 <td>${formattedVolatility}</td>
@@ -378,13 +393,16 @@ function updateVolatilityTable(data) {
 
 // Setup chart resize observer to maintain consistent chart height
 function setupChartResizeObserver() {
+    // One observer serves every redraw of the chart
+    if (chartResizeObserver) return;
+
     // Wait for the chart to be created
     setTimeout(() => {
         const chartCanvas = document.getElementById('volatilityChart');
-        if (chartCanvas) {
+        if (chartCanvas && !chartResizeObserver) {
 
             // Create a resize observer
-            const resizeObserver = new ResizeObserver(() => {
+            chartResizeObserver = new ResizeObserver(() => {
                 // If the chart exists, update it with minimal animation
                 if (volatilityChart) {
                     volatilityChart.resize();
@@ -396,7 +414,7 @@ function setupChartResizeObserver() {
             });
 
             // Start observing the chart canvas
-            resizeObserver.observe(chartCanvas);
+            chartResizeObserver.observe(chartCanvas);
         }
     }, 500);
 }
@@ -469,8 +487,8 @@ function updateVolatilityChart(data) {
             // Remove any loading overlays
             const chartContainer = document.getElementById('volatilityChartContainer');
             if (chartContainer) {
-                const loadingOverlays = chartContainer.querySelectorAll('.loading-overlay');
-                loadingOverlays.forEach(overlay => overlay.remove());
+                const overlays = chartContainer.querySelectorAll('.loading-overlay, .error-overlay');
+                overlays.forEach(overlay => overlay.remove());
             }
 
             // Create new chart
@@ -548,7 +566,7 @@ function updateVolatilityChart(data) {
             // Set up resize observer to maintain chart dimensions
             setupChartResizeObserver();
         } catch (error) {
-
+            showError(document.getElementById('volatilityChartContainer'), 'The chart could not be displayed');
         }
     }
 

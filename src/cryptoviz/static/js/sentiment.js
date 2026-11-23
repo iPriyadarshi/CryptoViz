@@ -6,6 +6,11 @@ let sentimentGaugeChart;
 let sentimentTrendChart;
 let chartResizeObserver = null;
 let selectedTimeRange = '24h';
+let sentimentSourcesTotal = 0;
+const nextSentimentSignal = createRequestTracker();
+
+// Most source cards to render at once; the header reports how many exist.
+const SOURCES_PAGE_SIZE = 200;
 
 /**
  * Number of days each time-range button represents.
@@ -16,6 +21,7 @@ let selectedTimeRange = '24h';
 const RANGE_DAYS = {
     '24h': 1,
     '7d': 7,
+    '14d': 14,
     '30d': 30,
     '90d': 90,
     '1y': 365
@@ -234,103 +240,52 @@ function loadSentimentData() {
     showLoading(document.getElementById('negativeTableBody'));
     showLoading(document.getElementById('sentimentSources'));
 
-    // First, try to trigger an update if data is stale
-    fetch(`${API_BASE_URL}/api/sentiment/update`)
-        .then(response => response.json())
-        .then(data => {
-
-            if (data.status === 'success') {
-
-            }
-        })
-        .catch(error => {
-
-        });
-
-    // Create promises for all API calls
-    const overallDays = daysForRange(selectedTimeRange);
-
-    // Add days parameter to overall sentiment API call
-    const overallPromise = fetch(`${API_BASE_URL}/api/sentiment/overall?days=${overallDays}`)
-        .then(response => {
-            if (!response.ok) {
-                throw new Error('Failed to fetch overall sentiment data');
-            }
-            return response.json();
-        });
-
-    // Add days parameter to rankings API call
-    const rankingsPromise = fetch(`${API_BASE_URL}/api/sentiment/rankings?days=${overallDays}`)
-        .then(response => {
-            if (!response.ok) {
-                throw new Error('Failed to fetch sentiment rankings');
-            }
-            return response.json();
-        });
-
-    // Add days parameter to sources API call
-    const sourcesPromise = fetch(`${API_BASE_URL}/api/sentiment/sources?days=${overallDays}`)
-        .then(response => {
-            if (!response.ok) {
-                throw new Error('Failed to fetch sentiment sources');
-            }
-            return response.json();
-        });
-
+    // A newer selection cancels this load, so stale data can never be shown
+    const signal = nextSentimentSignal();
     const days = daysForRange(selectedTimeRange);
 
-    // Build the URL for trends API
-    let trendsUrl = `${API_BASE_URL}/api/sentiment/trends?days=${days}&symbol=${selectedCrypto}`;
-
-    const trendsPromise = fetch(trendsUrl)
+    // A 404 means nothing has been collected yet, which is not a failure
+    const fetchSentimentJson = url => fetch(`${API_BASE_URL}${url}`, { signal })
         .then(response => {
+            if (response.status === 404) {
+                return null;
+            }
             if (!response.ok) {
-                throw new Error(`Failed to fetch sentiment trends: ${response.status} ${response.statusText}`);
+                throw new Error(`Failed to fetch ${url}: ${response.status}`);
             }
             return response.json();
-        })
-        .then(data => {
-
-            // Process price data to ensure it's properly formatted
-            if (data.price && Array.isArray(data.price)) {
-
-                // Check if all prices are the same
-                const allSamePrice = data.price.every((val, _, arr) => val === arr[0]);
-                if (allSamePrice) {
-
-                }
-
-                // Convert any string prices to numbers
-                data.price = data.price.map(price => {
-                    if (typeof price === 'string') {
-                        // Remove any currency symbols and commas
-                        return parseFloat(price.replace(/[$,]/g, ''));
-                    }
-                    return typeof price === 'number' ? price : 0;
-                });
-
-                // Log a warning if all prices are the same, but don't modify the data
-                if (allSamePrice && data.price[0] !== 0) {
-
-                }
-            } else {
-
-                // Initialize empty price array if none exists
-                if (!data.price) {
-                    data.price = [];
-                }
-            }
-
-            return data;
         });
+
+    const overallPromise = fetchSentimentJson(`/api/sentiment/overall?days=${days}`);
+    const rankingsPromise = fetchSentimentJson(`/api/sentiment/rankings?days=${days}`);
+    const sourcesPromise = fetchSentimentJson(
+        `/api/sentiment/sources?days=${days}&limit=${SOURCES_PAGE_SIZE}`
+    );
+
+    const trendsPromise = fetchSentimentJson(
+        `/api/sentiment/trends?days=${days}&symbol=${encodeURIComponent(selectedCrypto)}`
+    ).then(data => {
+        if (data && Array.isArray(data.price)) {
+            // A missing price stays a gap instead of dropping the line to $0
+            data.price = data.price.map(price => (typeof price === 'number' ? price : null));
+        }
+        return data;
+    });
 
     // Wait for all promises to resolve
     Promise.all([overallPromise, rankingsPromise, sourcesPromise, trendsPromise])
-        .then(([overallData, rankingsData, sourcesData, trendsData]) => {
-            // Check if we have valid data
-            if (!overallData || !rankingsData || !sourcesData) {
-                throw new Error('Incomplete data received from API');
+        .then(([overallData, initialRankings, initialSources, trendsData]) => {
+            let rankingsData = initialRankings;
+            let sourcesData = initialSources;
+
+            if (!overallData) {
+                showNoSentimentData();
+                return;
             }
+
+            rankingsData = rankingsData || { positive: [], negative: [] };
+            sourcesData = sourcesData || { sources: [], total: 0 };
+            sentimentSourcesTotal = sourcesData.total ?? (sourcesData.sources || []).length;
 
             // Check if we have valid trend data
             if (!trendsData || !trendsData.dates || !trendsData.sentiment || !trendsData.price ||
@@ -349,12 +304,13 @@ function loadSentimentData() {
             }
 
             // Update UI with real data
-            updateSentimentGauge(overallData.sentiment || 50);
+            updateSentimentGauge(overallData.sentiment ?? 50);
 
+            // A source that was unavailable is null and displays as N/A.
             updateSentimentStats({
-                socialSentiment: overallData.social_sentiment || 50,
-                newsSentiment: overallData.news_sentiment || 50,
-                fearGreedIndex: overallData.fear_greed_index || 50
+                socialSentiment: overallData.social_sentiment,
+                newsSentiment: overallData.news_sentiment,
+                fearGreedIndex: overallData.fear_greed_index
             });
 
             updateSentimentTrendChart(trendsData);
@@ -384,6 +340,14 @@ function loadSentimentData() {
             }
         })
         .catch(error => {
+            if (isAbortError(error)) {
+                return;
+            }
+
+            if (sentimentTrendChart) {
+                sentimentTrendChart.destroy();
+                sentimentTrendChart = null;
+            }
 
             // Hide loading spinners first
             hideLoading(document.querySelector('.sentiment-gauge-container'));
@@ -399,6 +363,36 @@ function loadSentimentData() {
             showError(document.getElementById('negativeTableBody'), 'Failed to load rankings');
             showError(document.getElementById('sentimentSources'), 'Failed to load sentiment sources. The system is collecting data from various sources. Please check back later.');
         });
+}
+
+// Show that collection has not produced a reading yet
+function showNoSentimentData() {
+    if (sentimentGaugeChart) {
+        sentimentGaugeChart.destroy();
+        sentimentGaugeChart = null;
+    }
+    if (sentimentTrendChart) {
+        sentimentTrendChart.destroy();
+        sentimentTrendChart = null;
+    }
+
+    const gaugeContainer = document.querySelector('.sentiment-gauge-container');
+    const chartContainer = document.querySelector('.chart-container');
+    const positiveBody = document.getElementById('positiveTableBody');
+    const negativeBody = document.getElementById('negativeTableBody');
+    const sourcesContainer = document.getElementById('sentimentSources');
+
+    [gaugeContainer, chartContainer, positiveBody, negativeBody, sourcesContainer].forEach(hideLoading);
+
+    document.getElementById('sentimentValue').textContent = 'N/A';
+    document.getElementById('sentimentDescription').textContent =
+        'Sentiment data is being collected. Please check back in a few minutes.';
+    updateSentimentStats({});
+
+    showMessage(chartContainer, 'No sentiment trend data yet.');
+    showMessage(positiveBody, 'No positive sentiment data available');
+    showMessage(negativeBody, 'No negative sentiment data available');
+    showMessage(sourcesContainer, 'No sentiment sources yet.');
 }
 
 // Update sentiment gauge
@@ -466,6 +460,7 @@ function updateSentimentGauge(sentimentValue) {
     try {
         if (sentimentGaugeChart) {
             sentimentGaugeChart.data.datasets[0].data = [sentimentValue, 100 - sentimentValue];
+            sentimentGaugeChart.data.datasets[0].backgroundColor[0] = getGradientColor(sentimentValue);
             sentimentGaugeChart.update();
         } else {
             const ctx = gaugeElement.getContext('2d');
@@ -524,17 +519,19 @@ function updateSentimentGauge(sentimentValue) {
 
 // Get gradient color based on sentiment value
 function getGradientColor(value) {
+    let colorVariable = '--negative-color';
     if (value >= 70) {
-        return 'var(--positive-color)';
+        colorVariable = '--positive-color';
     } else if (value >= 55) {
-        return 'var(--success-color)';
+        colorVariable = '--success-color';
     } else if (value >= 45) {
-        return 'var(--neutral-color)';
+        colorVariable = '--neutral-color';
     } else if (value >= 30) {
-        return 'var(--warning-color)';
-    } else {
-        return 'var(--negative-color)';
+        colorVariable = '--warning-color';
     }
+
+    // A canvas cannot read var(--name), so resolve the color first
+    return getComputedStyle(document.documentElement).getPropertyValue(colorVariable).trim();
 }
 
 // Update sentiment stats
@@ -543,40 +540,32 @@ function updateSentimentStats(stats) {
     const newsElement = document.getElementById('newsSentiment');
     const fearGreedElement = document.getElementById('fearGreedIndex');
 
-    if (socialElement) {
-        socialElement.textContent = `${stats.socialSentiment.toFixed(1)}%`;
-        socialElement.className = 'stat-value';
-        if (stats.socialSentiment >= 60) {
-            socialElement.classList.add('positive');
-        } else if (stats.socialSentiment <= 40) {
-            socialElement.classList.add('negative');
-        } else {
-            socialElement.classList.add('neutral');
-        }
+    setSentimentStat(socialElement, stats.socialSentiment, value => `${value.toFixed(1)}%`);
+    setSentimentStat(newsElement, stats.newsSentiment, value => `${value.toFixed(1)}%`);
+    setSentimentStat(fearGreedElement, stats.fearGreedIndex,
+        value => `${Math.round(value)} (${getFearGreedLabel(value)})`);
+}
+
+// Show one stat, or N/A when its source returned no data
+function setSentimentStat(element, value, format) {
+    if (!element) {
+        return;
     }
 
-    if (newsElement) {
-        newsElement.textContent = `${stats.newsSentiment.toFixed(1)}%`;
-        newsElement.className = 'stat-value';
-        if (stats.newsSentiment >= 60) {
-            newsElement.classList.add('positive');
-        } else if (stats.newsSentiment <= 40) {
-            newsElement.classList.add('negative');
-        } else {
-            newsElement.classList.add('neutral');
-        }
+    element.className = 'stat-value';
+    if (value === null || value === undefined) {
+        element.textContent = 'N/A';
+        element.classList.add('neutral');
+        return;
     }
 
-    if (fearGreedElement) {
-        fearGreedElement.textContent = `${stats.fearGreedIndex} (${getFearGreedLabel(stats.fearGreedIndex)})`;
-        fearGreedElement.className = 'stat-value';
-        if (stats.fearGreedIndex >= 60) {
-            fearGreedElement.classList.add('positive');
-        } else if (stats.fearGreedIndex <= 40) {
-            fearGreedElement.classList.add('negative');
-        } else {
-            fearGreedElement.classList.add('neutral');
-        }
+    element.textContent = format(value);
+    if (value >= 60) {
+        element.classList.add('positive');
+    } else if (value <= 40) {
+        element.classList.add('negative');
+    } else {
+        element.classList.add('neutral');
     }
 }
 
@@ -710,12 +699,9 @@ function updateSentimentTrendChart(trends) {
         sentimentTrendChart = null;
     }
 
-    // Remove any existing canvas and create a new one
-    let chartElement = document.getElementById('sentimentTrendChart');
-    if (chartElement) {
-
-        chartElement.remove();
-    }
+    // Remove the old canvas and any message, then create a new canvas
+    chartContainer.innerHTML = '';
+    let chartElement;
 
     // Create a new canvas element
 
@@ -774,6 +760,9 @@ function updateSentimentTrendChart(trends) {
         // Calculate appropriate min/max for price axis based on the data
         const priceAxisSettings = calculatePriceAxisSettings(trends.price, selectedCrypto);
 
+        // Individual markers only help when there are few points
+        const showPoints = trends.dates.length <= 48;
+
         // Prepare datasets
         const datasets = [
             {
@@ -785,7 +774,7 @@ function updateSentimentTrendChart(trends) {
                 fill: true,
                 tension: 0.4,
                 yAxisID: 'y',
-                pointRadius: 4,
+                pointRadius: showPoints ? 4 : 0,
                 pointHoverRadius: 6
             }
         ];
@@ -801,7 +790,7 @@ function updateSentimentTrendChart(trends) {
                 borderDash: [],
                 tension: 0.2,
                 yAxisID: 'y1',
-                pointRadius: 6,
+                pointRadius: showPoints ? 6 : 0,
                 pointHoverRadius: 8,
                 pointBackgroundColor: 'rgb(255, 0, 0)',
                 pointBorderColor: '#fff',
@@ -816,7 +805,7 @@ function updateSentimentTrendChart(trends) {
         sentimentTrendChart = new Chart(ctx, {
             type: 'line',
             data: {
-                labels: trends.dates,
+                labels: trends.dates.map(date => parseServerTime(date).toLocaleString()),
                 datasets: datasets
             },
             options: {
@@ -849,7 +838,9 @@ function updateSentimentTrendChart(trends) {
                                 size: 12
                             },
                             maxRotation: 45,
-                            minRotation: 45
+                            minRotation: 45,
+                            autoSkip: true,
+                            maxTicksLimit: 12
                         }
                     },
                     y: {
@@ -895,7 +886,7 @@ function updateSentimentTrendChart(trends) {
                         suggestedMin: (() => {
                             // If all prices are the same, create a range around the price
                             const allSamePrice = trends.price.every((val, _, arr) => val === arr[0]);
-                            if (allSamePrice && trends.price.length > 0) {
+                            if (allSamePrice && trends.price[0] !== null) {
                                 const price = trends.price[0];
                                 // Create a range of ±5% around the price
                                 return price * 0.95;
@@ -905,7 +896,7 @@ function updateSentimentTrendChart(trends) {
                         suggestedMax: (() => {
                             // If all prices are the same, create a range around the price
                             const allSamePrice = trends.price.every((val, _, arr) => val === arr[0]);
-                            if (allSamePrice && trends.price.length > 0) {
+                            if (allSamePrice && trends.price[0] !== null) {
                                 const price = trends.price[0];
                                 // Create a range of ±5% around the price
                                 return price * 1.05;
@@ -973,9 +964,8 @@ function updateSentimentTrendChart(trends) {
                         boxHeight: 12,
                         callbacks: {
                             title: function(tooltipItems) {
-                                // Format the date for better readability
-                                const date = new Date(tooltipItems[0].label);
-                                return date.toLocaleString();
+                                // The labels are already in the viewer's local time
+                                return tooltipItems[0].label;
                             },
                             label: function(context) {
                                 let label = context.dataset.label || '';
@@ -1033,8 +1023,8 @@ function updateSentimentRankings(rankings) {
             row.innerHTML = `
                 <td>${index + 1}</td>
                 <td class="crypto-name">
-                    <span>${crypto.name}</span>
-                    <small>${crypto.symbol.toUpperCase()}</small>
+                    <span>${escapeHtml(crypto.name)}</span>
+                    <small>${escapeHtml(crypto.symbol.toUpperCase())}</small>
                 </td>
                 <td>
                     <div class="sentiment-score">
@@ -1073,8 +1063,8 @@ function updateSentimentRankings(rankings) {
             row.innerHTML = `
                 <td>${index + 1}</td>
                 <td class="crypto-name">
-                    <span>${crypto.name}</span>
-                    <small>${crypto.symbol.toUpperCase()}</small>
+                    <span>${escapeHtml(crypto.name)}</span>
+                    <small>${escapeHtml(crypto.symbol.toUpperCase())}</small>
                 </td>
                 <td>
                     <div class="sentiment-score">
@@ -1136,7 +1126,7 @@ function updateSentimentSources(sources) {
             // Format the timestamp
             let formattedTimestamp = source.timestamp;
             try {
-                const date = new Date(source.timestamp);
+                const date = parseServerTime(source.timestamp);
                 if (!isNaN(date.getTime())) {
                     formattedTimestamp = date.toLocaleString();
                 }
@@ -1145,7 +1135,7 @@ function updateSentimentSources(sources) {
             }
 
             // Prepare the source link
-            let sourceLink = source.url || '#';
+            const sourceLink = safeUrl(source.url);
             let sourceLinkText = 'Read more';
 
             // Customize link text based on source type
@@ -1157,21 +1147,23 @@ function updateSentimentSources(sources) {
                 sourceLinkText = 'Read full article';
             }
 
+            const sourceType = String(source.type ?? '');
+
             sourceItem.innerHTML = `
                 <div class="source-header">
-                    <span class="source-type ${source.type}">${source.type === 'x' ? 'X' : source.type.charAt(0).toUpperCase() + source.type.slice(1)}</span>
-                    <span class="source-timestamp">${formattedTimestamp}</span>
+                    <span class="source-type ${escapeHtml(sourceType)}">${sourceType === 'x' ? 'X' : escapeHtml(sourceType.charAt(0).toUpperCase() + sourceType.slice(1))}</span>
+                    <span class="source-timestamp">${escapeHtml(formattedTimestamp)}</span>
                 </div>
                 <div class="source-content">
-                    <div class="source-title">${source.title}</div>
-                    <p class="source-text">${source.text}</p>
-                    <a href="${sourceLink}" class="source-link" target="_blank" rel="noopener noreferrer">
+                    <div class="source-title">${escapeHtml(source.title)}</div>
+                    ${source.text ? `<p class="source-text">${escapeHtml(source.text)}</p>` : ''}
+                    <a href="${escapeHtml(sourceLink)}" class="source-link" target="_blank" rel="noopener noreferrer">
                         ${sourceLinkText} <i class="fas fa-external-link-alt"></i>
                     </a>
                 </div>
                 <div class="source-sentiment ${sentimentClass}">
                     <i class="fas ${sentimentClass === 'positive' ? 'fa-thumbs-up' : sentimentClass === 'negative' ? 'fa-thumbs-down' : 'fa-minus'}"></i>
-                    <span>Sentiment: ${source.sentiment.toFixed(1)}%</span>
+                    <span>Sentiment: ${source.sentiment == null ? 'N/A' : `${source.sentiment.toFixed(1)}%`}</span>
                 </div>
             `;
 
@@ -1213,7 +1205,9 @@ function filterSentimentSources() {
     if (headerElement) {
         const totalCount = sourceItems.length;
         if (selectedSource === 'all') {
-            headerElement.textContent = `Sentiment Sources (${totalCount} total)`;
+            headerElement.textContent = sentimentSourcesTotal > totalCount
+                ? `Sentiment Sources (latest ${totalCount} of ${sentimentSourcesTotal})`
+                : `Sentiment Sources (${totalCount} total)`;
         } else {
             headerElement.textContent = `${selectedSource.charAt(0).toUpperCase() + selectedSource.slice(1)} Sources (${visibleCount} of ${totalCount})`;
         }
@@ -1252,24 +1246,50 @@ function updateLastUpdated() {
 function showLoading(element) {
     if (!element) return;
 
-    // Save original content
-    element.setAttribute('data-original-content', element.innerHTML);
-
-    // Show loading spinner
-    element.innerHTML = `
+    const spinner = `
         <div class="loading-spinner">
             <div class="spinner-border text-primary" role="status">
                 <span class="visually-hidden">Loading...</span>
             </div>
         </div>
     `;
+
+    // The gauge and chart keep their canvases, so the spinner sits on top
+    if (keepsCanvas(element)) {
+        showStateOverlay(element, spinner);
+        return;
+    }
+
+    element.innerHTML = spinner;
+}
+
+// Whether an element's canvas must survive loading and error states
+function keepsCanvas(element) {
+    return element.matches('.sentiment-gauge-container, .chart-container');
+}
+
+// Show content over an element without replacing what it holds
+function showStateOverlay(element, content) {
+    element.querySelector('.state-overlay')?.remove();
+
+    const overlay = document.createElement('div');
+    overlay.className = 'state-overlay';
+    overlay.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;' +
+        'justify-content:center;z-index:5;';
+    overlay.innerHTML = content;
+
+    if (getComputedStyle(element).position === 'static') {
+        element.style.position = 'relative';
+    }
+    element.appendChild(overlay);
 }
 
 // Hide loading spinner
 function hideLoading(element) {
     if (!element) return;
 
-    // Remove loading spinner if it exists
+    // Remove the loading state if it exists
+    element.querySelector('.state-overlay')?.remove();
     const spinner = element.querySelector('.loading-spinner');
     if (spinner) {
         spinner.remove();
@@ -1280,12 +1300,19 @@ function hideLoading(element) {
 function showError(element, message) {
     if (!element) return;
 
-    element.innerHTML = `
+    const content = `
         <div class="error-message">
             <i class="fas fa-exclamation-circle"></i>
-            <p>${message}</p>
+            <p>${escapeHtml(message)}</p>
         </div>
     `;
+
+    if (keepsCanvas(element)) {
+        showStateOverlay(element, content);
+        return;
+    }
+
+    element.innerHTML = content;
 }
 
 // Show information message
@@ -1300,7 +1327,7 @@ function showMessage(element, message) {
     messageDiv.className = 'info-message';
     messageDiv.innerHTML = `
         <i class="fas fa-info-circle"></i>
-        <p>${message}</p>
+        <p>${escapeHtml(message)}</p>
     `;
 
     // Special handling for chart container
@@ -1409,7 +1436,9 @@ function updateSentimentChartTheme(theme) {
 
     // Also update the gauge chart if it exists
     if (sentimentGaugeChart) {
-        // Just redraw the chart - the colors are determined by the sentiment value
+        // The color is resolved from the theme's variables
+        sentimentGaugeChart.data.datasets[0].backgroundColor[0] =
+            getGradientColor(sentimentGaugeChart.data.datasets[0].data[0]);
         sentimentGaugeChart.update();
     }
 }
@@ -1489,46 +1518,6 @@ function formatPrice(price) {
             minimumFractionDigits: 6,
             maximumFractionDigits: 8
         });
-    }
-}
-
-// Format market cap value
-function formatMarketCap(marketCap) {
-    if (typeof marketCap !== 'number' || isNaN(marketCap)) {
-        return '$0 USD';
-    }
-
-    // The market cap values are already in billions, so we need to adjust our thresholds
-    if (marketCap >= 1000) {
-        return `$${(marketCap / 1000).toFixed(2)} Trillion USD`;
-    } else if (marketCap >= 1) {
-        return `$${marketCap.toFixed(2)} Billion USD`;
-    } else if (marketCap >= 0.001) {
-        return `$${(marketCap * 1000).toFixed(2)} Million USD`;
-    } else if (marketCap >= 0.000001) {
-        return `$${(marketCap * 1000000).toFixed(2)} Thousand USD`;
-    } else {
-        return `$${marketCap.toFixed(2)} USD`;
-    }
-}
-
-// Format volume value
-function formatVolume(volume) {
-    if (typeof volume !== 'number' || isNaN(volume)) {
-        return '$0 USD';
-    }
-
-    // The volume values are already in billions, so we need to adjust our thresholds
-    if (volume >= 1000) {
-        return `$${(volume / 1000).toFixed(2)} Trillion USD`;
-    } else if (volume >= 1) {
-        return `$${volume.toFixed(2)} Billion USD`;
-    } else if (volume >= 0.001) {
-        return `$${(volume * 1000).toFixed(2)} Million USD`;
-    } else if (volume >= 0.000001) {
-        return `$${(volume * 1000000).toFixed(2)} Thousand USD`;
-    } else {
-        return `$${volume.toFixed(2)} USD`;
     }
 }
 

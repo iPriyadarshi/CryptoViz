@@ -6,18 +6,16 @@ Referenced by the cryptoviz-web systemd unit:
     gunicorn --config deploy/gunicorn.conf.py cryptoviz.wsgi:app
 """
 
-import multiprocessing
 import os
 
 # nginx talks to gunicorn over a unix socket rather than a TCP port, so the app
 # is not reachable from outside the instance except through nginx.
 bind = os.getenv("GUNICORN_BIND", "unix:/run/cryptoviz/gunicorn.sock")
 
-# The usual CPU-based formula, capped: this workload is IO-bound against SQLite
-# and a handful of analytics queries, and every extra worker is another process
-# holding the database open. On a small instance (t3.micro/small) this lands at
-# 2-3 workers, which is plenty.
-workers = int(os.getenv("GUNICORN_WORKERS", min(multiprocessing.cpu_count() * 2 + 1, 5)))
+# Fixed rather than CPU-based: t3 instances report 2 vCPUs at any memory size,
+# and each worker holds its own copy of pandas and a SQLite page cache. With
+# threads below, two workers are plenty for this workload.
+workers = int(os.getenv("GUNICORN_WORKERS") or 2)
 
 # Threads let a worker keep serving while another request waits on a query.
 threads = int(os.getenv("GUNICORN_THREADS", 4))

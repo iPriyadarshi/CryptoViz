@@ -1,26 +1,10 @@
 // API_BASE_URL is imported from config.js
 
-// Check if Chart.js is loaded
-if (typeof Chart === 'undefined') {
-
-    // Try to load Chart.js dynamically if not available
-    const script = document.createElement('script');
-    script.src = 'https://cdn.jsdelivr.net/npm/chart.js';
-    script.async = true;
-    script.onload = function() {
-
-        initPage();
-    };
-    script.onerror = function() {
-
-        alert('Failed to load Chart.js library. Please refresh the page or check your internet connection.');
-    };
-    document.head.appendChild(script);
-}
-
 // Global variables
 let correlationChart;
 let selectedTimeRange = '7';
+let chartResizeObserver = null;
+const nextCorrelationSignal = createRequestTracker();
 
 /**
  * Update correlation chart theme based on current theme
@@ -44,13 +28,16 @@ function updateCorrelationChartTheme(theme) {
 
 // Setup chart resize observer to maintain consistent chart height
 function setupChartResizeObserver() {
+    // One observer serves every redraw of the chart
+    if (chartResizeObserver) return;
+
     // Wait for the chart to be created
     setTimeout(() => {
         const chartCanvas = document.getElementById('correlationChart');
-        if (chartCanvas) {
+        if (chartCanvas && !chartResizeObserver) {
 
             // Create a resize observer
-            const resizeObserver = new ResizeObserver(() => {
+            chartResizeObserver = new ResizeObserver(() => {
                 // If the chart exists, update it with minimal animation
                 if (correlationChart) {
                     correlationChart.resize();
@@ -62,7 +49,7 @@ function setupChartResizeObserver() {
             });
 
             // Start observing the chart canvas
-            resizeObserver.observe(chartCanvas);
+            chartResizeObserver.observe(chartCanvas);
         }
     }, 500);
 }
@@ -130,6 +117,7 @@ function setupTimeRangeButtons() {
 
 // Fetch correlation data from API
 async function fetchCorrelationData() {
+    const signal = nextCorrelationSignal();
     const matrixElement = document.getElementById('correlationMatrix');
     const chartContainer = document.getElementById('correlationChartContainer');
 
@@ -169,36 +157,36 @@ async function fetchCorrelationData() {
             showLoading(chartContainer);
         }
 
-        const response = await fetch(`${API_BASE_URL}/api/crypto/correlation?days=${selectedTimeRange}`);
+        const response = await fetch(`${API_BASE_URL}/api/crypto/correlation?days=${selectedTimeRange}`, { signal });
 
         if (!response.ok) {
-            const errorText = await response.text();
-            throw new Error(`API error ${response.status}: ${errorText}`);
-        }
-
-        // Parse the JSON response
-        let data;
-        try {
-            data = await response.json();
-
-        } catch (jsonError) {
-
-            throw new Error(`Failed to parse JSON response: ${jsonError.message}`);
+            throw new Error(`API error ${response.status}`);
         }
 
         // Process the data if valid
-        processCorrelationData(data);
+        processCorrelationData(await response.json());
 
     } catch (error) {
+        if (isAbortError(error)) return;
+
+        clearCorrelationChart();
 
         // Show error messages
         if (matrixElement) {
-            showError(matrixElement, `Failed to load correlation data: ${error.message}`);
+            showError(matrixElement, 'Failed to load correlation data');
         }
 
         if (chartContainer) {
-            showError(chartContainer, `Failed to load correlation data: ${error.message}`);
+            showError(chartContainer, 'Failed to load correlation data');
         }
+    }
+}
+
+// Remove the chart so an old range is not left behind a message
+function clearCorrelationChart() {
+    if (correlationChart) {
+        correlationChart.destroy();
+        correlationChart = null;
     }
 }
 
@@ -262,7 +250,7 @@ function processCorrelationData(data) {
         } catch (chartError) {
 
             if (chartContainer) {
-                showError(chartContainer, `Error rendering chart: ${chartError.message}`);
+                showError(chartContainer, 'The chart could not be displayed');
             }
         }
 
@@ -271,13 +259,14 @@ function processCorrelationData(data) {
         // Explicitly clear any remaining loading overlays
         clearLoadingOverlays();
     } else {
+        clearCorrelationChart();
 
         if (matrixElement) {
-            showError(matrixElement, 'No correlation data available');
+            showError(matrixElement, 'Not enough price history for this range yet');
         }
 
         if (chartContainer) {
-            showError(chartContainer, 'No correlation data available');
+            showError(chartContainer, 'Not enough price history for this range yet');
         }
     }
 }
@@ -315,7 +304,7 @@ function updateCorrelationMatrix(correlationMatrix, symbols) {
     // Header row
     tableHTML += '<tr><th></th>';
     symbols.forEach(symbol => {
-        tableHTML += `<th>${String(symbol).toUpperCase()}</th>`;
+        tableHTML += `<th>${escapeHtml(String(symbol).toUpperCase())}</th>`;
     });
     tableHTML += '</tr>';
 
@@ -327,7 +316,7 @@ function updateCorrelationMatrix(correlationMatrix, symbols) {
             return;
         }
 
-        tableHTML += `<tr><th>${String(symbols[rowIndex]).toUpperCase()}</th>`;
+        tableHTML += `<tr><th>${escapeHtml(String(symbols[rowIndex]).toUpperCase())}</th>`;
 
         // Ensure row is an array
         if (!Array.isArray(row)) {
@@ -669,7 +658,7 @@ function updateCorrelationChart(correlationMatrix, symbols) {
 
         const chartContainer = document.getElementById('correlationChartContainer');
         if (chartContainer) {
-            showError(chartContainer, `Error creating chart: ${error.message}`);
+            showError(chartContainer, 'The chart could not be displayed');
         }
     }
 }

@@ -13,10 +13,11 @@ sleeps and tries again, so one failing source never takes the collector down.
 import logging
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from .. import config
 from ..db import repository as db
+from ..db.models import utc_now
 from ..scrapers import CryptoDataScraper, SentimentScraper, TopGainersScraper
 from . import analytics
 
@@ -38,12 +39,12 @@ def collect_prices():
         logger.warning("Price scrape returned no data")
         return 0
 
-    db.save_prices(data)
+    stored = db.save_prices(data)
 
     # Keep the hourly/daily rollups current so the long-range chart endpoints
     # stay in the millisecond range instead of re-aggregating the whole table.
     try:
-        since = datetime.now() - timedelta(days=BUCKET_REFRESH_WINDOW_DAYS)
+        since = utc_now() - timedelta(days=BUCKET_REFRESH_WINDOW_DAYS)
         db.refresh_price_buckets(since=since)
     except Exception:
         # A stale rollup degrades long-range charts; it must not fail the scrape,
@@ -51,14 +52,23 @@ def collect_prices():
         logger.exception("Failed to refresh price rollup buckets")
 
     analytics.cleanup_old_data()
-    logger.info("Stored %d price rows", len(data))
-    return len(data)
+    logger.info("Stored %d price rows", stored)
+    return stored
 
 
 def collect_sentiment():
-    """Run the sentiment scrape and trim old snapshots."""
+    """
+    Run the sentiment scrape and trim old snapshots.
+
+    Returns:
+        bool: Whether a snapshot was stored.
+    """
     scraper = SentimentScraper()
     scraper.run_scraper()
+
+    if not scraper.saved:
+        logger.warning("Sentiment scrape stored no snapshot")
+        return False
 
     removed = scraper.cleanup_old_sentiment_data()
     logger.info("Sentiment snapshot stored (%d old snapshots removed)", removed or 0)
@@ -76,7 +86,7 @@ def collect_top_gainers():
 
     db.save_top_gainers(data)
 
-    cutoff = datetime.now() - timedelta(days=config.TOP_GAINERS_RETENTION_DAYS)
+    cutoff = utc_now() - timedelta(days=config.TOP_GAINERS_RETENTION_DAYS)
     db.delete_top_gainers_before(cutoff)
 
     logger.info("Stored top gainers snapshot with %d entries", len(data))

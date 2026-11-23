@@ -5,14 +5,15 @@ const apiUrl = API_BASE_URL + "/api/crypto";
 let selectedTimeRange = '24h'; // Default to 24 hours
 let zeroBasedChart = null; // Chart with zero-based normalization
 let minMaxChart = null; // Chart with min-max normalization
+const nextChartSignal = createRequestTracker();
+
+// Pegged assets would only draw a flat line on a normalized chart.
+const EXCLUDED_SYMBOLS = ['usdt', 'usdc'];
 
 // Initialize the page when DOM is loaded
 document.addEventListener('DOMContentLoaded', function() {
     // Initialize time range buttons
     setupTimeRangeButtons();
-
-    // Set initial last updated text
-    updateLastUpdatedText();
 
     // Fetch data and render charts
     fetchAllCryptosData();
@@ -76,6 +77,7 @@ document.addEventListener('DOMContentLoaded', function() {
 const TIME_RANGE_DAYS = {
     '24h': 1,
     '7d': 7,
+    '14d': 14,
     '1m': 30,
     '3m': 90,
     '1y': 365
@@ -88,9 +90,15 @@ const TIME_RANGE_DAYS = {
  * fetching full history and trimming here would mean downloading roughly a
  * million points to draw a few hundred.
  */
-async function fetchHistoricalData(symbol, timeRange) {
+async function fetchHistoricalData(symbol, timeRange, signal) {
     const days = TIME_RANGE_DAYS[timeRange] || 1;
-    const response = await fetch(`${apiUrl}/${symbol}/history?days=${days}`);
+    const response = await fetch(
+        `${apiUrl}/${encodeURIComponent(symbol)}/history?days=${days}`,
+        { signal }
+    );
+    if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+    }
     const data = await response.json();
 
     return {
@@ -115,9 +123,6 @@ function setupTimeRangeButtons() {
 
                 // Fetch data and update charts
                 fetchAllCryptosData();
-
-                // Update last updated text
-                updateLastUpdatedText();
             }
         });
     });
@@ -134,22 +139,74 @@ function updateLastUpdatedText() {
 
 // Update fetchAllCryptosData to pass the selected time range
 async function fetchAllCryptosData() {
-    // Exclude USDT and USDC from the normalized chart
-    const cryptos = ['btc', 'eth', 'xrp', 'bnb', 'sol', 'doge', 'trx', 'ada']; // List of top cryptos excluding stablecoins
-    const cryptoDataPromises = cryptos.map(symbol => fetchHistoricalData(symbol, selectedTimeRange));
+    const signal = nextChartSignal();
 
     try {
-        const allCryptoData = await Promise.all(cryptoDataPromises);
+        // Chart whichever coins are currently tracked, leaving out stablecoins
+        const listResponse = await fetch(apiUrl, { signal });
+        if (!listResponse.ok) {
+            throw new Error(`HTTP error! status: ${listResponse.status}`);
+        }
+        const list = await listResponse.json();
+        const symbols = (list.data || [])
+            .map(crypto => crypto.symbol)
+            .filter(symbol => !EXCLUDED_SYMBOLS.includes(symbol));
+
+        const allCryptoData = await Promise.all(
+            symbols.map(symbol => fetchHistoricalData(symbol, selectedTimeRange, signal))
+        );
+        const cryptosWithData = allCryptoData.filter(crypto => crypto.timestamps.length > 0);
+
+        if (cryptosWithData.length === 0) {
+            showChartsMessage('No price history for this range yet');
+            return;
+        }
 
         // Process the data for both charts
-        const processedData = processChartData(allCryptoData);
+        const processedData = processChartData(cryptosWithData);
+
+        clearChartNotice(document.getElementById('zeroBasedChart'));
+        clearChartNotice(document.getElementById('minMaxChart'));
 
         // Render both charts with different normalization methods
         renderZeroBasedChart(processedData);
         renderMinMaxChart(processedData);
+        updateLastUpdatedText();
     } catch (error) {
+        if (isAbortError(error)) {
+            return;
+        }
         console.error("Error fetching or rendering chart data:", error);
+        showChartsMessage('Failed to load chart data');
     }
+}
+
+// Replace both charts with a message
+function showChartsMessage(message) {
+    if (zeroBasedChart) {
+        zeroBasedChart.destroy();
+        zeroBasedChart = null;
+    }
+    if (minMaxChart) {
+        minMaxChart.destroy();
+        minMaxChart = null;
+    }
+    showChartNotice(document.getElementById('zeroBasedChart'), message);
+    showChartNotice(document.getElementById('minMaxChart'), message);
+}
+
+// Format a server timestamp as a compact axis label for the selected range
+function formatAxisLabel(timestamp) {
+    const date = parseServerTime(timestamp);
+    if (selectedTimeRange === '24h') {
+        return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    }
+    if (selectedTimeRange === '7d' || selectedTimeRange === '14d') {
+        return date.toLocaleString([], {
+            month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
+        });
+    }
+    return date.toLocaleDateString([], { month: 'short', day: 'numeric', year: '2-digit' });
 }
 
 // Process chart data to prepare for rendering
@@ -207,9 +264,9 @@ function processChartData(cryptoData) {
                     // Linear interpolation between two points
                     const beforePrice = priceMap[beforeTimestamp];
                     const afterPrice = priceMap[afterTimestamp];
-                    const beforeTime = new Date(beforeTimestamp).getTime();
-                    const afterTime = new Date(afterTimestamp).getTime();
-                    const currentTime = new Date(timestamp).getTime();
+                    const beforeTime = parseServerTime(beforeTimestamp).getTime();
+                    const afterTime = parseServerTime(afterTimestamp).getTime();
+                    const currentTime = parseServerTime(timestamp).getTime();
 
                     const ratio = (currentTime - beforeTime) / (afterTime - beforeTime);
                     const interpolatedPrice = beforePrice + ratio * (afterPrice - beforePrice);
@@ -234,7 +291,7 @@ function processChartData(cryptoData) {
     });
 
     return {
-        labels,
+        labels: labels.map(formatAxisLabel),
         processedCryptos
     };
 }
@@ -282,6 +339,12 @@ function renderZeroBasedChart(data) {
         };
     });
 
+    // Fit the axis to the data, so that no line falls below the visible range
+    const lowestValue = Math.min(...datasets.flatMap(
+        dataset => dataset.data.filter(value => value !== null)
+    ));
+    const axisMin = Math.max(0, Math.floor(lowestValue) - 1);
+
     const canvas = document.getElementById('zeroBasedChart');
 
     if (!canvas) {
@@ -301,8 +364,8 @@ function renderZeroBasedChart(data) {
             zeroBasedChart.data.labels = labels;
             zeroBasedChart.data.datasets = datasets;
 
-            // Ensure y-axis range is maintained (90-100 for zero-based chart)
-            zeroBasedChart.options.scales.y.min = 90;
+            // Refit the y-axis to the new data
+            zeroBasedChart.options.scales.y.min = axisMin;
             zeroBasedChart.options.scales.y.max = 100;
             zeroBasedChart.options.scales.y.beginAtZero = false;
 
@@ -364,14 +427,12 @@ function renderZeroBasedChart(data) {
                         }
                     },
                     y: {
-                        min: 90,
+                        min: axisMin,
                         max: 100,
-                        beginAtZero: false, // Start y-axis at 90
-                        suggestedMin: 90, // Suggest minimum value
-                        suggestedMax: 100, // Suggest maximum value
+                        beginAtZero: false, // The axis is fitted to the data
                         title: {
                             display: true,
-                            text: 'Normalized Price (90 - 100)',
+                            text: 'Price as % of Period High',
                             color: textColor
                         },
                         ticks: {
@@ -379,7 +440,6 @@ function renderZeroBasedChart(data) {
                                 return value.toFixed(2); // Format ticks to 2 decimal places
                             },
                             color: textColor,
-                            stepSize: 2, // Create ticks at 90, 92, 94, 96, 98, 100
                             precision: 0 // Ensure whole numbers for major ticks
                         },
                         grid: {
@@ -460,8 +520,11 @@ function renderMinMaxChart(data) {
         const maxPrice = Math.max(...validPrices);
 
         // Normalize the data to a range between 0 and 100
+        // A price that never moved has no range to normalize, so it is not drawn
         const normalizedPrices = interpolatedPrices.map(price =>
-            price !== null ? ((price - minPrice) / (maxPrice - minPrice)) * 100 : null
+            price !== null && maxPrice > minPrice
+                ? ((price - minPrice) / (maxPrice - minPrice)) * 100
+                : null
         );
 
         // Get the base color for this cryptocurrency
@@ -687,7 +750,17 @@ function getColorForSymbol(symbol) {
     // Combine both color sets
     const allColors = {...colors, ...extendedColors};
 
-    return allColors[symbol] || 'rgb(200, 200, 200)'; // Default grey if not found
+    if (allColors[symbol]) {
+        return allColors[symbol];
+    }
+
+    // A coin without its own color still gets a stable, distinct one
+    const fallbackColors = [
+        'rgb(0, 200, 170)', 'rgb(255, 99, 71)', 'rgb(154, 205, 50)',
+        'rgb(186, 85, 211)', 'rgb(70, 180, 240)', 'rgb(240, 200, 90)'
+    ];
+    const hash = [...symbol].reduce((total, char) => total + char.charCodeAt(0), 0);
+    return fallbackColors[hash % fallbackColors.length];
 }
 
 // Update page elements based on current theme
@@ -732,19 +805,6 @@ function updateChartTheme(chart, theme) {
         chart.options.scales.y.grid.color = gridColor;
         chart.options.scales.x.ticks.color = textColor;
         chart.options.scales.y.ticks.color = textColor;
-
-        // Ensure y-axis range is maintained during theme changes
-        // For zero-based chart, use 90-100 range
-        if (chart === zeroBasedChart) {
-            chart.options.scales.y.min = 90;
-            chart.options.scales.y.max = 100;
-            chart.options.scales.y.beginAtZero = false;
-        } else {
-            // For min-max chart, keep the full 0-100 range
-            chart.options.scales.y.min = 0;
-            chart.options.scales.y.max = 100;
-            chart.options.scales.y.beginAtZero = true;
-        }
 
         // Ensure spanGaps is enabled
         chart.options.spanGaps = true;

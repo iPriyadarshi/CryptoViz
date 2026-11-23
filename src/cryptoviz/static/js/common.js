@@ -10,6 +10,101 @@ document.addEventListener('DOMContentLoaded', function() {
 });
 
 /**
+ * Escape a value for use in an HTML template. Names, titles and symbols come
+ * from scraped third-party pages, so they must never be inserted as markup.
+ */
+function escapeHtml(value) {
+    return String(value ?? '').replace(/[&<>"']/g, char => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;'
+    })[char]);
+}
+
+/**
+ * Return a link target only if it is http(s), so a scraped javascript: URL
+ * can never become a live link.
+ */
+function safeUrl(url) {
+    try {
+        const parsed = new URL(url);
+        return ['http:', 'https:'].includes(parsed.protocol) ? parsed.href : '#';
+    } catch (error) {
+        return '#';
+    }
+}
+
+/**
+ * Parse a server timestamp. The API sends UTC without an offset, which the
+ * Date constructor would otherwise read as the viewer's local time.
+ */
+function parseServerTime(value) {
+    const text = String(value);
+    if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2})?$/.test(text)) {
+        return new Date(`${text.replace(' ', 'T')}Z`);
+    }
+    return new Date(value);
+}
+
+/**
+ * Create a function that cancels the previous request and returns a signal for
+ * the next one, so a slow old response can never overwrite a newer selection.
+ */
+function createRequestTracker() {
+    let controller = null;
+    return function nextSignal() {
+        if (controller) {
+            controller.abort();
+        }
+        controller = new AbortController();
+        return controller.signal;
+    };
+}
+
+/**
+ * Whether an error only means the request was replaced by a newer one.
+ */
+function isAbortError(error) {
+    return Boolean(error) && error.name === 'AbortError';
+}
+
+/**
+ * Show a message over a chart's canvas without removing the canvas.
+ */
+function showChartNotice(canvas, message) {
+    const container = canvas && canvas.parentElement;
+    if (!container) {
+        return;
+    }
+
+    let notice = container.querySelector('.chart-notice');
+    if (!notice) {
+        notice = document.createElement('div');
+        notice.className = 'chart-notice';
+        notice.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;' +
+            'justify-content:center;text-align:center;padding:1rem;pointer-events:none;' +
+            'color:var(--text-secondary);';
+        if (getComputedStyle(container).position === 'static') {
+            container.style.position = 'relative';
+        }
+        container.appendChild(notice);
+    }
+    notice.textContent = message;
+}
+
+/**
+ * Remove a message added by showChartNotice.
+ */
+function clearChartNotice(canvas) {
+    const notice = canvas && canvas.parentElement && canvas.parentElement.querySelector('.chart-notice');
+    if (notice) {
+        notice.remove();
+    }
+}
+
+/**
  * Add a subtle shadow to the sticky navbar once the page is scrolled.
  */
 function initNavbarScroll() {

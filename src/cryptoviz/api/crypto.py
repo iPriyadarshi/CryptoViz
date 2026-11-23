@@ -18,8 +18,9 @@ def _window_days(default=7):
     """
     Read the `days` query parameter, falling back on missing or invalid input.
 
-    Values are clamped to the retention window: asking for more history than is
-    kept would silently return a shorter series than the label promises.
+    Only the windows the frontend offers are accepted. Values are clamped to the
+    retention window: asking for more history than is kept would silently return
+    a shorter series than the label promises.
 
     Returns:
         int: A positive number of days.
@@ -28,7 +29,7 @@ def _window_days(default=7):
         days = int(request.args.get("days", default))
     except TypeError, ValueError:
         return default
-    if days <= 0:
+    if days not in config.ALLOWED_WINDOW_DAYS:
         return default
     return min(days, config.PRICE_RETENTION_DAYS)
 

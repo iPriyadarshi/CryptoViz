@@ -162,14 +162,35 @@ def test_sentiment_trends_shape(client, clean_db, price_rows):
     from cryptoviz.db import repository as repo
 
     repo.save_prices(price_rows)
-    repo.save_sentiment_snapshot({"overall": {"sentiment": 55.0}})
+    repo.save_sentiment_snapshot(
+        {
+            "overall": {"sentiment": 70.0},
+            "crypto_specific": {"BTC": {"sentiment_scores": [10.0, 20.0]}},
+        }
+    )
 
     body = client.get("/api/sentiment/trends?days=7&symbol=BTC").get_json()
 
     assert len(body["dates"]) == len(body["sentiment"]) == len(body["price"])
     assert len(body["dates"]) == 1
+    # A coin's trend uses that coin's scores, not the whole-market reading.
+    assert body["sentiment"] == [15.0]
     # The price was matched against the stored series, not left null.
     assert body["price"][0] is not None
+
+    market = client.get("/api/sentiment/trends?days=7&symbol=all").get_json()
+    assert market["sentiment"] == [70.0]
+
+
+def test_sentiment_trends_leave_a_gap_without_a_reading(client, clean_db):
+    """A coin no article mentioned is not plotted as a neutral 50."""
+    from cryptoviz.db import repository as repo
+
+    repo.save_sentiment_snapshot({"overall": {"sentiment": 55.0}})
+
+    body = client.get("/api/sentiment/trends?days=7&symbol=ETH").get_json()
+
+    assert body == {"dates": [], "sentiment": [], "price": []}
 
 
 def test_sentiment_trends_empty_without_snapshots(client, clean_db):
@@ -206,12 +227,57 @@ def test_top_gainers_respects_limit(client, clean_db):
     assert len(body["data"]) == 5
 
 
-def test_update_endpoint_skips_recent_data(client, clean_db):
-    """A just-written snapshot is not re-scraped without force."""
+@pytest.mark.parametrize(
+    "path", ["/api/top-gainers/update?force=true", "/api/sentiment/update?force=true"]
+)
+def test_requests_cannot_trigger_a_scrape(client, path):
+    """Scraping belongs to the worker, so the old trigger routes are gone."""
+    assert client.get(path).status_code == 404
+
+
+def test_top_gainers_read_never_scrapes_or_writes(client, clean_db, monkeypatch):
+    """An empty table is a 404, and a reader's limit cannot shrink stored data."""
+    from cryptoviz.db import repository as repo
+    from cryptoviz.scrapers import TopGainersScraper
+
+    def fail(*_args, **_kwargs):
+        raise AssertionError("a GET must not scrape")
+
+    monkeypatch.setattr(TopGainersScraper, "get_top_gainers", fail)
+
+    assert client.get("/api/top-gainers?limit=1").status_code == 404
+    assert repo.get_latest_top_gainers() == (None, [])
+
+
+def test_sources_limit_is_capped(client, clean_db):
+    """An absurd limit is clamped instead of overflowing SQLite."""
+    response = client.get("/api/sentiment/sources?limit=9223372036854775808")
+
+    assert response.status_code == 200
+
+
+def test_overall_ignores_missing_components(client, clean_db):
+    """A source that was unavailable stays null instead of averaging as 50."""
     from cryptoviz.db import repository as repo
 
-    repo.save_top_gainers([{"symbol": "sol", "rank": 1}])
+    for news in (20.0, 40.0):
+        repo.save_sentiment_snapshot(
+            {
+                "overall": {
+                    "sentiment": news,
+                    "social_sentiment": None,
+                    "news_sentiment": news,
+                    "fear_greed_index": None,
+                }
+            }
+        )
 
-    body = client.get("/api/top-gainers/update").get_json()
+    body = client.get("/api/sentiment/overall?days=7").get_json()
 
-    assert body["status"] == "skipped"
+    assert body["news_sentiment"] == 30.0
+    assert body["social_sentiment"] is None
+
+
+def test_overall_with_no_data_is_404_for_every_window(client, clean_db):
+    """No window invents a neutral reading on an empty database."""
+    assert client.get("/api/sentiment/overall?days=7").status_code == 404

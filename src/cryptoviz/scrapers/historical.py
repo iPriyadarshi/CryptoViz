@@ -1,262 +1,239 @@
 """
 One-off historical price backfill.
 
-Fetches 31 days of 5-minute-resolution price history from CoinGecko for the
-tracked coins and writes it into the crypto_prices table, so that volatility and
-correlation have data to work with before the live scraper has accumulated any.
+Fetches price history from CoinGecko for the current top 10 coins and writes it
+into the crypto_prices table, so that volatility and correlation have data to
+work with before the live scraper has accumulated any. Points are stored at the
+times CoinGecko reports them, which is hourly for these ranges.
 
 CoinGecko rate-limits aggressively on the free tier, so requests are chunked by
-week and deliberately paced; a full run takes several minutes.
+week and deliberately paced; a full run takes several minutes. Each coin is saved
+as soon as it is fetched, and re-running only updates rows that already exist.
 
 Run it with:  uv run cryptoviz-backfill
 """
 
 import logging
 import time
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
-import numpy as np
 import pandas as pd
 import requests
 
-from .. import config
 from ..db import engine as db_engine
 from ..db import repository as db
+from ..db.models import TIMESTAMP_FORMAT
+from .base import DEFAULT_USER_AGENT
 
 logger = logging.getLogger(__name__)
 
-# CoinGecko coin IDs mapped to symbols (lowercase as requested)
-COINS = {
-    "bitcoin": "btc",
-    "ethereum": "eth",
-    "tether": "usdt",
-    "ripple": "xrp",
-    "binancecoin": "bnb",
-    "solana": "sol",
-    "usd-coin": "usdc",
-    "dogecoin": "doge",
-    "tron": "trx",
-    "cardano": "ada",
-}
+# How far back a backfill reaches unless told otherwise.
+DEFAULT_BACKFILL_DAYS = 31
 
-# Names as shown in the example
-COIN_NAMES = {
-    "btc": "Bitcoin",
-    "eth": "Ethereum",
-    "usdt": "Tether",
-    "xrp": "XRP",
-    "bnb": "BNB",
-    "sol": "Solana",
-    "usdc": "USDC",
-    "doge": "Dogecoin",
-    "trx": "TRON",
-    "ada": "Cardano",
-}
+MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
+RANGE_URL = "https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart/range"
 
+REQUEST_TIMEOUT_SECONDS = 15
+CHUNK_DAYS = 7
+SECONDS_BETWEEN_CHUNKS = 10
+SECONDS_BETWEEN_COINS = 15
+REQUEST_ATTEMPTS = 3
 
-def find_closest_timestamp(target_ts, timestamps_list):
-    timestamps_array = np.array([ts[0] for ts in timestamps_list])
-    idx = (np.abs(timestamps_array - target_ts)).argmin()
-    return idx
+# Wait after a failed request, and the most a Retry-After header can ask for.
+RETRY_SECONDS = 60
+MAX_RETRY_SECONDS = 120
+
+# Used only when the current top 10 cannot be fetched.
+FALLBACK_COINS = (
+    ("bitcoin", "btc", "Bitcoin"),
+    ("ethereum", "eth", "Ethereum"),
+    ("tether", "usdt", "Tether"),
+    ("ripple", "xrp", "XRP"),
+    ("binancecoin", "bnb", "BNB"),
+    ("solana", "sol", "Solana"),
+    ("usd-coin", "usdc", "USDC"),
+    ("dogecoin", "doge", "Dogecoin"),
+    ("tron", "trx", "TRON"),
+    ("cardano", "ada", "Cardano"),
+)
 
 
-def get_historical_crypto_data(days=None, interval_minutes=None):
+def _retry_delay(response):
+    """Seconds to wait after a 429, honoring Retry-After up to a limit."""
+    try:
+        seconds = int(response.headers.get("Retry-After", RETRY_SECONDS))
+    except TypeError, ValueError:
+        seconds = RETRY_SECONDS
+    return min(max(seconds, 1), MAX_RETRY_SECONDS)
+
+
+def _request_json(url, params):
     """
-    Fetch historical prices for every tracked coin.
-
-    Args:
-        days (int, optional): How far back to reach. Defaults to the
-            configured price retention window.
-        interval_minutes (int, optional): Spacing of the sampled series.
-            Defaults to 5 for short windows and 60 for long ones, because
-            CoinGecko's free tier only returns 5-minute granularity for
-            about a day - asking for finer spacing over a year just
-            resamples the same hourly points.
+    GET a JSON document, retrying rate limits and transient failures.
 
     Returns:
-        list[dict]: price rows ready for the database.
+        dict | list | None: The parsed body, or None when every attempt failed.
     """
-    if days is None:
-        days = config.PRICE_RETENTION_DAYS
-    if interval_minutes is None:
-        interval_minutes = 5 if days <= 31 else 60
+    headers = {"User-Agent": DEFAULT_USER_AGENT}
 
-    end_time = datetime.now()
-    start_time = end_time - timedelta(days=days)
-
-    end_time = end_time.replace(second=0, microsecond=0)
-    minute_remainder = end_time.minute % interval_minutes
-    end_time = end_time - timedelta(minutes=minute_remainder)
-    time_intervals = []
-    current_time = end_time
-    while current_time >= start_time:
-        time_intervals.append(current_time)
-        current_time -= timedelta(minutes=interval_minutes)
-
-    time_intervals.reverse()
-
-    total_intervals = len(time_intervals)
-    collection_intervals = time_intervals
-
-    logger.info(f"Collecting {total_intervals} intervals at 5-minute frequency")
-
-    all_data = []
-
-    for coin_id, symbol in COINS.items():
-        logger.info(f"Processing {coin_id}...")
-
-        time.sleep(15)
-
-        chunk_size = 7
-        chunk_start = start_time
-
-        all_prices = []
-        all_market_caps = []
-        all_volumes = []
-
-        while chunk_start < end_time:
-            chunk_end = min(chunk_start + timedelta(days=chunk_size), end_time)
-            chunk_from_ts = int(chunk_start.timestamp())
-            chunk_to_ts = int(chunk_end.timestamp())
-
-            logger.info(
-                f"Fetching data for period: {chunk_start.strftime('%Y-%m-%d')} to {chunk_end.strftime('%Y-%m-%d')}"
-            )
-
-            url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart/range"
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-            }
-            params = {"vs_currency": "usd", "from": chunk_from_ts, "to": chunk_to_ts}
-
-            try:
-                response = requests.get(url, headers=headers, params=params)
-                response.raise_for_status()
-                data = response.json()
-
-                chunk_prices = data.get("prices", [])
-                chunk_market_caps = data.get("market_caps", [])
-                chunk_volumes = data.get("total_volumes", [])
-
-                all_prices.extend(chunk_prices)
-                all_market_caps.extend(chunk_market_caps)
-                all_volumes.extend(chunk_volumes)
-
-                if chunk_end < end_time:
-                    logger.info("Waiting between chunks...")
-                    time.sleep(10)
-
-                chunk_start = chunk_end
-
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Error fetching data: {e}")
-                time.sleep(60)
-
-                try:
-                    retry_headers = {
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.131 Safari/537.36 Edg/92.0.902.73"
-                    }
-                    response = requests.get(url, headers=retry_headers, params=params)
-                    response.raise_for_status()
-                    data = response.json()
-
-                    chunk_prices = data.get("prices", [])
-                    chunk_market_caps = data.get("market_caps", [])
-                    chunk_volumes = data.get("total_volumes", [])
-
-                    all_prices.extend(chunk_prices)
-                    all_market_caps.extend(chunk_market_caps)
-                    all_volumes.extend(chunk_volumes)
-
-                    chunk_start = chunk_end
-
-                except Exception as retry_error:
-                    logger.error(f"Error fetching data after retry: {retry_error}")
-                    chunk_start = chunk_end
-                    continue
-
-        prices = all_prices
-        market_caps = all_market_caps
-        volumes = all_volumes
-
-        if not prices:
-            logger.warning(f"No price data available for {coin_id}")
-            continue
-
+    for attempt in range(1, REQUEST_ATTEMPTS + 1):
+        delay = RETRY_SECONDS
         try:
-            for interval_time in collection_intervals:
-                interval_ts = int(interval_time.timestamp() * 1000)
+            response = requests.get(
+                url, headers=headers, params=params, timeout=REQUEST_TIMEOUT_SECONDS
+            )
+            if response.status_code == 429:
+                delay = _retry_delay(response)
+                logger.warning("Rate limited by CoinGecko; waiting %ds", delay)
+            else:
+                response.raise_for_status()
+                return response.json()
+        except (requests.RequestException, ValueError) as exc:
+            logger.warning("CoinGecko request failed: %s", exc)
 
-                price_idx = find_closest_timestamp(interval_ts, prices)
-                price_ts = prices[price_idx][0]
-                price = prices[price_idx][1]
+        if attempt < REQUEST_ATTEMPTS:
+            time.sleep(delay)
 
-                if abs(price_ts - interval_ts) > 30 * 60 * 1000:
-                    continue
+    return None
 
-                market_cap_idx = find_closest_timestamp(interval_ts, market_caps)
-                market_cap = market_caps[market_cap_idx][1] / 1e9
 
-                volume_idx = find_closest_timestamp(interval_ts, volumes)
-                volume = volumes[volume_idx][1] / 1e9
+def _tracked_coins():
+    """Return (coin id, symbol, name) for the current top 10 by market cap."""
+    params = {
+        "vs_currency": "usd",
+        "order": "market_cap_desc",
+        "per_page": 10,
+        "page": 1,
+        "sparkline": False,
+    }
+    markets = _request_json(MARKETS_URL, params)
+    if not markets:
+        logger.warning("Could not fetch the top 10; using the built-in coin list")
+        return FALLBACK_COINS
+    return [(c["id"], c["symbol"].lower(), c["name"]) for c in markets]
 
-                day_ago_interval = interval_time - timedelta(days=1)
-                day_ago_ts = int(day_ago_interval.timestamp() * 1000)
 
-                percent_change_24h = None
-                if interval_time >= start_time + timedelta(days=1):
-                    day_ago_idx = find_closest_timestamp(day_ago_ts, prices)
-                    if abs(prices[day_ago_idx][0] - day_ago_ts) <= 30 * 60 * 1000:
-                        price_24h_ago = prices[day_ago_idx][1]
-                        if price_24h_ago > 0:
-                            percent_change_24h = (
-                                (price - price_24h_ago) / price_24h_ago
-                            ) * 100
+def _build_rows(symbol, name, prices, market_caps, volumes):
+    """
+    Turn CoinGecko's parallel series into price rows.
 
-                ts_str = interval_time.strftime("%Y-%m-%d %H:%M:%S")
+    Args:
+        symbol (str): Lowercase coin symbol.
+        name (str): Display name.
+        prices, market_caps, volumes (list): [millisecond timestamp, value] pairs.
 
-                all_data.append(
-                    {
-                        "symbol": symbol,
-                        "name": COIN_NAMES[symbol],
-                        "price": price,
-                        "market_cap": round(market_cap, 2),
-                        "volume_24h": round(volume, 2),
-                        "percent_change_24h": round(percent_change_24h, 2)
-                        if percent_change_24h is not None
-                        else None,
-                        "timestamp": ts_str,
-                    }
-                )
+    Returns:
+        list[dict]: Rows with UTC timestamps, USD amounts, and a 24h change that
+        is None when no point exists about a day earlier.
+    """
+    if not prices:
+        return []
 
-            logger.info(f"Finished processing {coin_id}")
+    frame = pd.DataFrame(prices, columns=["ms", "price"]).drop_duplicates("ms")
+    for column, series in (("market_cap", market_caps), ("volume_24h", volumes)):
+        values = pd.DataFrame(series, columns=["ms", column]).drop_duplicates("ms")
+        frame = frame.merge(values, on="ms", how="left")
 
-        except Exception as e:
-            logger.error(f"Error processing data for {coin_id}: {e}")
+    frame = frame.sort_values("ms")
+    frame["time"] = pd.to_datetime(frame["ms"], unit="ms").astype("datetime64[ns]")
+    frame["day_ago"] = frame["time"] - pd.Timedelta(days=1)
 
-    return all_data
+    earlier = frame[["time", "price"]].rename(
+        columns={"time": "earlier_time", "price": "earlier_price"}
+    )
+    frame = pd.merge_asof(
+        frame.sort_values("day_ago"),
+        earlier,
+        left_on="day_ago",
+        right_on="earlier_time",
+        direction="nearest",
+        tolerance=pd.Timedelta(minutes=30),
+    )
+    frame["change"] = (frame["price"] / frame["earlier_price"] - 1) * 100
+
+    return [
+        {
+            "symbol": symbol,
+            "name": name,
+            "price": row.price,
+            "market_cap": row.market_cap,
+            "volume_24h": row.volume_24h,
+            "percent_change_24h": round(row.change, 2) if pd.notna(row.change) else None,
+            "timestamp": row.time.strftime(TIMESTAMP_FORMAT),
+        }
+        for row in frame.itertuples()
+    ]
+
+
+def _fetch_coin(coin_id, symbol, name, start, end):
+    """Fetch one coin's history in weekly chunks and build its rows."""
+    prices, market_caps, volumes = [], [], []
+    url = RANGE_URL.format(coin_id=coin_id)
+
+    chunk_start = start
+    while chunk_start < end:
+        chunk_end = min(chunk_start + timedelta(days=CHUNK_DAYS), end)
+        logger.info(
+            "Fetching %s: %s to %s",
+            coin_id,
+            chunk_start.strftime("%Y-%m-%d"),
+            chunk_end.strftime("%Y-%m-%d"),
+        )
+
+        params = {
+            "vs_currency": "usd",
+            "from": int(chunk_start.timestamp()),
+            "to": int(chunk_end.timestamp()),
+        }
+        data = _request_json(url, params)
+        if data is None:
+            logger.error(
+                "Gap in %s history: no data from %s to %s",
+                coin_id,
+                chunk_start.strftime("%Y-%m-%d"),
+                chunk_end.strftime("%Y-%m-%d"),
+            )
+        else:
+            prices.extend(data.get("prices", []))
+            market_caps.extend(data.get("market_caps", []))
+            volumes.extend(data.get("total_volumes", []))
+
+        chunk_start = chunk_end
+        if chunk_start < end:
+            time.sleep(SECONDS_BETWEEN_CHUNKS)
+
+    return _build_rows(symbol, name, prices, market_caps, volumes)
 
 
 def main(days=None):
     """Fetch the historical window and persist it to the database."""
-    crypto_data = get_historical_crypto_data(days=days)
-
-    if not crypto_data:
-        logger.error("No historical data collected; nothing was written")
-        return 1
-
-    df = pd.DataFrame(crypto_data)
-    df["percent_change_24h"] = df["percent_change_24h"].fillna(0)
-    df = df.sort_values(by=["timestamp", "symbol"])
+    days = days or DEFAULT_BACKFILL_DAYS
+    end = datetime.now(UTC).replace(microsecond=0)
+    start = end - timedelta(days=days)
 
     db_engine.init_db()
-    records = df.to_dict("records")
-    db.save_prices(records)
-    logger.info("Saved %d historical price records to the database", len(records))
+
+    stored = 0
+    for index, (coin_id, symbol, name) in enumerate(_tracked_coins()):
+        if index:
+            time.sleep(SECONDS_BETWEEN_COINS)
+
+        rows = _fetch_coin(coin_id, symbol, name, start, end)
+        if not rows:
+            logger.warning("No price data available for %s", coin_id)
+            continue
+
+        written = db.save_prices(rows)
+        stored += written
+        logger.info("Saved %d rows for %s", written, coin_id)
+
+    if not stored:
+        logger.error("No historical data collected; nothing was written")
+        return 1
 
     # The backfill inserts history behind the current time, which the
     # worker's short trailing refresh would never reach - rebuild in full.
     logger.info("Rebuilding price rollups over the backfilled range")
     written = db.refresh_price_buckets()
-    logger.info("Rollup buckets written: %s", written)
+    logger.info("Saved %d historical rows; rollup buckets written: %s", stored, written)
     return 0

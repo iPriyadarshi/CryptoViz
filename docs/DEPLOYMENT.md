@@ -80,9 +80,9 @@ It is idempotent — safe to re-run — and performs these steps:
 1. Installs nginx and supporting packages.
 2. Installs **uv** to `/usr/local/bin/uv`.
 3. Creates the `cryptoviz` system user (no shell, no login).
-4. Copies the code to `/opt/cryptoviz` and creates `/var/lib/cryptoviz` for the database.
-5. Seeds `/opt/cryptoviz/.env` from `.env.example`, pointing the DB at `/var/lib/cryptoviz/crypto.db`.
-6. Runs `uv sync --frozen --no-dev` — installs exactly what `uv.lock` pins.
+4. Copies the code and its git history to `/opt/cryptoviz` and creates `/var/lib/cryptoviz` for the database.
+5. Seeds `/opt/cryptoviz/.env` from `.env.example`, pointing the DB at `/var/lib/cryptoviz/crypto.db`. An existing `.env` is kept.
+6. Runs `deploy/sync-env.sh` — installs Python under `/opt/cryptoviz/.python` and exactly what `uv.lock` pins.
 7. Downloads the NLTK VADER lexicon to `/usr/local/share/nltk_data` so neither service reaches for the network at startup.
 8. Installs and starts both systemd units, and the nginx site.
 
@@ -242,9 +242,11 @@ sudo systemctl status  cryptoviz-worker
 sudo bash /opt/cryptoviz/deploy/update.sh
 ```
 
-Pulls, re-syncs dependencies, restarts both services and verifies the health
-check — rolling back is then just `git reset` to the previous commit and running
-it again. The database is untouched.
+Pulls the tracked branch, re-syncs dependencies, restarts both services and
+checks that gunicorn answers and the worker is running. The database is
+untouched. To roll back, revert the bad commit on the branch and deploy again:
+the script always moves to the latest commit, so a local `git reset` would be
+undone.
 
 ### Inspecting the database
 
@@ -280,6 +282,25 @@ off-instance durability, sync them to S3:
 ```bash
 aws s3 sync /var/backups/cryptoviz s3://your-bucket/cryptoviz-backups/
 ```
+
+### Restoring a backup
+
+Stop both services and remove the `-wal` and `-shm` files first. A leftover WAL
+would be replayed into the restored file and silently corrupt its contents.
+
+```bash
+sudo systemctl stop cryptoviz-web cryptoviz-worker
+
+sudo rm -f /var/lib/cryptoviz/crypto.db-wal /var/lib/cryptoviz/crypto.db-shm
+gunzip -c /var/backups/cryptoviz/crypto-YYYYMMDD-HHMMSS.db.gz \
+    | sudo tee /var/lib/cryptoviz/crypto.db >/dev/null
+sudo chown cryptoviz:cryptoviz /var/lib/cryptoviz/crypto.db
+
+sudo -u cryptoviz sqlite3 /var/lib/cryptoviz/crypto.db 'PRAGMA integrity_check;'   # expect: ok
+sudo systemctl start cryptoviz-web cryptoviz-worker
+```
+
+The worker rebuilds the price rollups when it starts.
 
 ---
 
@@ -335,9 +356,8 @@ sudo -u cryptoviz sqlite3 /var/lib/cryptoviz/crypto.db \
     'SELECT COUNT(*) FROM crypto_prices;'
 ```
 
-`0` rows with `Request to https://coinmarketcap.com/ failed` in the log is
-normal and _not_ fatal — the scraper falls back to CoinGecko. If the fallback
-also fails, check outbound connectivity:
+Prices and top gainers come from CoinGecko. If the log shows
+`Request to https://api.coingecko.com/... failed`, check outbound connectivity:
 
 ```bash
 curl -s 'https://api.coingecko.com/api/v3/ping'
@@ -388,11 +408,11 @@ check `journalctl -u cryptoviz-worker` for a failure.
 ### The instance runs out of memory
 
 Correlation over a long window is the heaviest operation. On a 1 GB `t3.micro`,
-reduce the worker count and add swap:
+shrink the SQLite cache and add swap:
 
 ```bash
 # in /opt/cryptoviz/.env
-GUNICORN_WORKERS=2
+CRYPTOVIZ_DB_CACHE_KIB=16384
 
 sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile
 sudo mkswap /swapfile && sudo swapon /swapfile
@@ -415,7 +435,7 @@ sudo -u cryptoviz .venv/bin/python -c 'from cryptoviz.wsgi import app'
 
 | Path                                      | Contents                                                     |
 | ----------------------------------------- | ------------------------------------------------------------ |
-| `/opt/cryptoviz`                          | Application code and the `.venv`                             |
+| `/opt/cryptoviz`                          | Application code, git history, `.python` and `.venv`         |
 | `/opt/cryptoviz/.env`                     | Configuration (mode `640`, owned by `cryptoviz`)             |
 | `/var/lib/cryptoviz/crypto.db`            | The SQLite database — **the only stateful thing on the box** |
 | `/var/backups/cryptoviz`                  | Local backups                                                |
@@ -424,8 +444,9 @@ sudo -u cryptoviz .venv/bin/python -c 'from cryptoviz.wsgi import app'
 | `/etc/systemd/system/cryptoviz-*.service` | Service units                                                |
 | `/var/log/nginx/cryptoviz.*.log`          | nginx access and error logs                                  |
 
-Everything except `/var/lib/cryptoviz` is reproducible from the repository, so a
-backup of that one directory is a full backup of the deployment.
+The code is reproducible from the repository. A full backup of the deployment is
+`/var/lib/cryptoviz` plus `/opt/cryptoviz/.env`; `/etc/letsencrypt` can be
+re-issued with `deploy/setup-https.sh`.
 
 ---
 

@@ -12,7 +12,7 @@ set -euo pipefail
 
 APP_USER="cryptoviz"
 APP_DIR="/opt/cryptoviz"
-UV_BIN="/usr/local/bin/uv"
+SOCKET="/run/cryptoviz/gunicorn.sock"
 
 log() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 
@@ -23,17 +23,17 @@ fi
 
 cd "$APP_DIR"
 
-if [[ -d .git ]]; then
-    log "Fetching the latest code"
-    sudo -u "$APP_USER" git fetch --all --prune
-    sudo -u "$APP_USER" git reset --hard "@{u}"
-else
-    log "Not a git checkout; skipping the pull (copy the code in yourself)"
+if [[ ! -d .git ]]; then
+    echo "$APP_DIR is not a git checkout. Pull in your clone and re-run deploy/bootstrap.sh." >&2
+    exit 1
 fi
 
+log "Fetching the latest code"
+sudo -H -u "$APP_USER" git fetch --all --prune
+sudo -H -u "$APP_USER" git reset --hard "@{u}"
+
 log "Syncing dependencies"
-sudo -u "$APP_USER" env "PATH=/usr/local/bin:$PATH" HOME="/home/$APP_USER" \
-     "$UV_BIN" sync --frozen --no-dev
+bash "$APP_DIR/deploy/sync-env.sh"
 
 log "Reinstalling systemd units"
 install -m 644 "$APP_DIR/deploy/systemd/cryptoviz-web.service" \
@@ -46,12 +46,17 @@ log "Restarting services"
 systemctl restart cryptoviz-web.service
 systemctl restart cryptoviz-worker.service
 
-# Give gunicorn a moment to bind before checking.
-sleep 2
-if curl -fsS localhost/healthz >/dev/null; then
-    log "Deploy complete - health check passed"
-else
-    echo "Health check FAILED. Recent logs:" >&2
-    journalctl -u cryptoviz-web -n 40 --no-pager >&2
-    exit 1
-fi
+# Ask gunicorn directly: once HTTPS is on, plain localhost no longer reaches the
+# site. A cold start on a small instance can take a while to bind.
+for _ in {1..30}; do
+    if curl -fsS --max-time 3 --unix-socket "$SOCKET" http://localhost/healthz >/dev/null 2>&1 \
+        && systemctl is-active --quiet cryptoviz-worker.service; then
+        log "Deploy complete - health check passed"
+        exit 0
+    fi
+    sleep 2
+done
+
+echo "Health check FAILED. Recent logs:" >&2
+journalctl -u cryptoviz-web -u cryptoviz-worker -n 40 --no-pager >&2
+exit 1
